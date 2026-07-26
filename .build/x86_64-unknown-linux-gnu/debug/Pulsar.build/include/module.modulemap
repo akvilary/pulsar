@@ -1,3 +1,0 @@
-module Pulsar {
-    header "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/include/Pulsar-Swift.h"
-}
