@@ -15,7 +15,7 @@
 import Testing
 import Foundation
 import Synchronization
-import StarlightPoll
+import Pulsar
 
 #if canImport(Glibc)
 import Glibc

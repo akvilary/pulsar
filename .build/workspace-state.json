@@ -1,0 +1,30 @@
+{
+  "object" : {
+    "artifacts" : [
+
+    ],
+    "dependencies" : [
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "mio",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/akvilary/mio.git",
+          "name" : "mio"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "6db3c08f56cc93877b4554e9582d26b9b4320729",
+            "version" : "0.2.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "mio"
+      }
+    ],
+    "prebuilts" : [
+
+    ]
+  },
+  "version" : 7
+}

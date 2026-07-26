@@ -1,0 +1,26 @@
+{
+  "": {
+    "swift-dependencies": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/master.swiftdeps"
+  },
+  "/home/akvilary/work/libs/swift/pulsar/Sources/Pulsar/PaddedAtomic.swift": {
+    "dependencies": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PaddedAtomic.d",
+    "object": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PaddedAtomic.swift.o",
+    "swiftmodule": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PaddedAtomic~partial.swiftmodule",
+    "swift-dependencies": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PaddedAtomic.swiftdeps",
+    "diagnostics": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PaddedAtomic.dia"
+  },
+  "/home/akvilary/work/libs/swift/pulsar/Sources/Pulsar/PollEventLoop.swift": {
+    "dependencies": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PollEventLoop.d",
+    "object": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PollEventLoop.swift.o",
+    "swiftmodule": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PollEventLoop~partial.swiftmodule",
+    "swift-dependencies": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PollEventLoop.swiftdeps",
+    "diagnostics": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PollEventLoop.dia"
+  },
+  "/home/akvilary/work/libs/swift/pulsar/Sources/Pulsar/ReexportMIO.swift": {
+    "dependencies": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/ReexportMIO.d",
+    "object": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/ReexportMIO.swift.o",
+    "swiftmodule": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/ReexportMIO~partial.swiftmodule",
+    "swift-dependencies": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/ReexportMIO.swiftdeps",
+    "diagnostics": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/ReexportMIO.dia"
+  }
+}

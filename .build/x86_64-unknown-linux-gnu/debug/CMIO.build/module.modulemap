@@ -1,0 +1,4 @@
+module CMIO {
+    umbrella header "/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/CMIO/include/CMIO.h"
+    export *
+}

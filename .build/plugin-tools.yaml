@@ -1,0 +1,204 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "CMIO-x86_64-unknown-linux-gnu-debug.module": ["<CMIO-x86_64-unknown-linux-gnu-debug.module>"]
+  "MIO-x86_64-unknown-linux-gnu-debug.module": ["<MIO-x86_64-unknown-linux-gnu-debug.module>"]
+  "PackageStructure": ["<PackageStructure>"]
+  "Pulsar-x86_64-unknown-linux-gnu-debug.module": ["<Pulsar-x86_64-unknown-linux-gnu-debug.module>"]
+  "PulsarTests-x86_64-unknown-linux-gnu-debug.module": ["<PulsarTests-x86_64-unknown-linux-gnu-debug.module>"]
+  "main": ["<Pulsar-x86_64-unknown-linux-gnu-debug.module>"]
+  "pulsarPackageDiscoveredTests-x86_64-unknown-linux-gnu-debug.module": ["<pulsarPackageDiscoveredTests-x86_64-unknown-linux-gnu-debug.module>"]
+  "pulsarPackageTests-x86_64-unknown-linux-gnu-debug.module": ["<pulsarPackageTests-x86_64-unknown-linux-gnu-debug.module>"]
+  "pulsarPackageTests-x86_64-unknown-linux-gnu-debug.test": ["<pulsarPackageTests-x86_64-unknown-linux-gnu-debug.test>"]
+  "test": ["<Pulsar-x86_64-unknown-linux-gnu-debug.module>","<PulsarTests-x86_64-unknown-linux-gnu-debug.module>","<pulsarPackageTests-x86_64-unknown-linux-gnu-debug.test>"]
+default: "main"
+nodes:
+  "/home/akvilary/work/libs/swift/pulsar/Sources/Pulsar/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+  "/home/akvilary/work/libs/swift/pulsar/Tests/PulsarTests/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+commands:
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/wrapper.c.o":
+    tool: clang
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/CMIO/wrapper.c"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/wrapper.c.o"]
+    description: "Compiling CMIO wrapper.c"
+    args: ["/usr/bin/clang-15","-target","x86_64-unknown-linux-gnu","-O0","-DSWIFT_PACKAGE=1","-DDEBUG=1","-fblocks","-I","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/CMIO/include","-fPIC","-g","-fno-omit-frame-pointer","-w","-MD","-MT","dependencies","-MF","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/wrapper.c.d","-c","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/CMIO/wrapper.c","-o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/wrapper.c.o"]
+    deps: "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/wrapper.c.d"
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/MIO.swiftmodule.o":
+    tool: shell
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/MIO.swiftmodule"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/MIO.swiftmodule.o"]
+    description: "Wrapping AST for MIO for debugging"
+    args: ["/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc","-modulewrap","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/MIO.swiftmodule","-o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/MIO.swiftmodule.o","-target","x86_64-unknown-linux-gnu"]
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Events.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Interest.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Poll.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/PollConstants.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/PollError.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Ready.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Source.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Token.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Waker.swift"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/sources"]
+    description: "Write auxiliary file /home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/sources"
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/Pulsar.swiftmodule.o":
+    tool: shell
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/Pulsar.swiftmodule"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/Pulsar.swiftmodule.o"]
+    description: "Wrapping AST for Pulsar for debugging"
+    args: ["/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc","-modulewrap","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/Pulsar.swiftmodule","-o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/Pulsar.swiftmodule.o","-target","x86_64-unknown-linux-gnu"]
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/home/akvilary/work/libs/swift/pulsar/Sources/Pulsar/PaddedAtomic.swift","/home/akvilary/work/libs/swift/pulsar/Sources/Pulsar/PollEventLoop.swift","/home/akvilary/work/libs/swift/pulsar/Sources/Pulsar/ReexportMIO.swift"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/sources"]
+    description: "Write auxiliary file /home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/sources"
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PulsarTests.swiftmodule.o":
+    tool: shell
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/PulsarTests.swiftmodule"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PulsarTests.swiftmodule.o"]
+    description: "Wrapping AST for PulsarTests for debugging"
+    args: ["/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc","-modulewrap","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/PulsarTests.swiftmodule","-o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PulsarTests.swiftmodule.o","-target","x86_64-unknown-linux-gnu"]
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/home/akvilary/work/libs/swift/pulsar/Tests/PulsarTests/PollEventLoopTests.swift"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/sources"]
+    description: "Write auxiliary file /home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/sources"
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/pulsarPackageDiscoveredTests.swiftmodule.o":
+    tool: shell
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageDiscoveredTests.swiftmodule"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/pulsarPackageDiscoveredTests.swiftmodule.o"]
+    description: "Wrapping AST for pulsarPackageDiscoveredTests for debugging"
+    args: ["/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc","-modulewrap","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageDiscoveredTests.swiftmodule","-o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/pulsarPackageDiscoveredTests.swiftmodule.o","-target","x86_64-unknown-linux-gnu"]
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.derived/PulsarTests.swift","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.derived/all-discovered-tests.swift"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/sources"]
+    description: "Write auxiliary file /home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/sources"
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.derived/all-discovered-tests.swift":
+    tool: test-discovery-tool
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PollEventLoopTests.swift.o"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.derived/PulsarTests.swift","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.derived/all-discovered-tests.swift"]
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/pulsarPackageTests.swiftmodule.o":
+    tool: shell
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageTests.swiftmodule"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/pulsarPackageTests.swiftmodule.o"]
+    description: "Wrapping AST for pulsarPackageTests for debugging"
+    args: ["/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc","-modulewrap","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageTests.swiftmodule","-o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/pulsarPackageTests.swiftmodule.o","-target","x86_64-unknown-linux-gnu"]
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.derived/runner.swift"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/sources"]
+    description: "Write auxiliary file /home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/sources"
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.derived/runner.swift":
+    tool: test-entry-point-tool
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageDiscoveredTests.swiftmodule"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.derived/runner.swift"]
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.product/Objects.LinkFileList":
+    tool: write-auxiliary-file
+    inputs: ["<link-file-list>","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/wrapper.c.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Events.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Interest.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/MIO.swiftmodule.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Poll.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/PollConstants.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/PollError.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Ready.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Source.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Token.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Waker.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PaddedAtomic.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PollEventLoop.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/Pulsar.swiftmodule.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/ReexportMIO.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PollEventLoopTests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PulsarTests.swiftmodule.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/PulsarTests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/all-discovered-tests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/pulsarPackageDiscoveredTests.swiftmodule.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/pulsarPackageTests.swiftmodule.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/runner.swift.o"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.product/Objects.LinkFileList"]
+    description: "Write auxiliary file /home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.product/Objects.LinkFileList"
+
+  "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/swift-version-2C347D80D5C5DB36.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/swift-version-2C347D80D5C5DB36.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/swift-version-2C347D80D5C5DB36.txt"
+
+  "<CMIO-x86_64-unknown-linux-gnu-debug.module>":
+    tool: phony
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/wrapper.c.o"]
+    outputs: ["<CMIO-x86_64-unknown-linux-gnu-debug.module>"]
+
+  "<MIO-x86_64-unknown-linux-gnu-debug.module>":
+    tool: phony
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Events.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Interest.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Poll.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/PollConstants.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/PollError.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Ready.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Source.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Token.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Waker.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/MIO.swiftmodule"]
+    outputs: ["<MIO-x86_64-unknown-linux-gnu-debug.module>"]
+
+  "<Pulsar-x86_64-unknown-linux-gnu-debug.module>":
+    tool: phony
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PaddedAtomic.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PollEventLoop.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/ReexportMIO.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/Pulsar.swiftmodule"]
+    outputs: ["<Pulsar-x86_64-unknown-linux-gnu-debug.module>"]
+
+  "<PulsarTests-x86_64-unknown-linux-gnu-debug.module>":
+    tool: phony
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PollEventLoopTests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/PulsarTests.swiftmodule"]
+    outputs: ["<PulsarTests-x86_64-unknown-linux-gnu-debug.module>"]
+
+  "<pulsarPackageDiscoveredTests-x86_64-unknown-linux-gnu-debug.module>":
+    tool: phony
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/PulsarTests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/all-discovered-tests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageDiscoveredTests.swiftmodule"]
+    outputs: ["<pulsarPackageDiscoveredTests-x86_64-unknown-linux-gnu-debug.module>"]
+
+  "<pulsarPackageTests-x86_64-unknown-linux-gnu-debug.module>":
+    tool: phony
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/runner.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageTests.swiftmodule"]
+    outputs: ["<pulsarPackageTests-x86_64-unknown-linux-gnu-debug.module>"]
+
+  "<pulsarPackageTests-x86_64-unknown-linux-gnu-debug.test>":
+    tool: phony
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.xctest"]
+    outputs: ["<pulsarPackageTests-x86_64-unknown-linux-gnu-debug.test>"]
+
+  "C.MIO-x86_64-unknown-linux-gnu-debug.module":
+    tool: shell
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Events.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Interest.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Poll.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/PollConstants.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/PollError.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Ready.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Source.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Token.swift","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/MIO/Waker.swift","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/swift-version-2C347D80D5C5DB36.txt","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/wrapper.c.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/sources"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Events.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Interest.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Poll.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/PollConstants.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/PollError.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Ready.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Source.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Token.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Waker.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/MIO.swiftmodule"]
+    description: "Compiling Swift Module 'MIO' (9 sources)"
+    args: ["/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc","-module-name","MIO","-emit-dependencies","-emit-module","-emit-module-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/MIO.swiftmodule","-output-file-map","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/output-file-map.json","-parse-as-library","-incremental","-c","@/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/sources","-I","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules","-target","x86_64-unknown-linux-gnu","-incremental","-enable-batch-mode","-serialize-diagnostics","-index-store-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/index/store","-Onone","-enable-testing","-j12","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-Xcc","-fmodule-map-file=/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/module.modulemap","-Xcc","-I","-Xcc","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/CMIO/include","-module-cache-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/ModuleCache","-parseable-output","-parse-as-library","-emit-objc-header","-emit-objc-header-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/include/MIO-Swift.h","-swift-version","6","-enable-upcoming-feature","NonisolatedNonsendingByDefault","-enable-experimental-feature","Lifetimes","-enable-experimental-feature","StrictMemorySafety","-g","-Xcc","-fPIC","-Xcc","-g","-suppress-warnings","-user-module-version","0.2.0","-package-name","mio","-Xcc","-fno-omit-frame-pointer"]
+
+  "C.Pulsar-x86_64-unknown-linux-gnu-debug.module":
+    tool: shell
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/Sources/Pulsar/PaddedAtomic.swift","/home/akvilary/work/libs/swift/pulsar/Sources/Pulsar/PollEventLoop.swift","/home/akvilary/work/libs/swift/pulsar/Sources/Pulsar/ReexportMIO.swift","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/swift-version-2C347D80D5C5DB36.txt","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/MIO.swiftmodule","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/sources"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PaddedAtomic.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PollEventLoop.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/ReexportMIO.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/Pulsar.swiftmodule"]
+    description: "Compiling Swift Module 'Pulsar' (3 sources)"
+    args: ["/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc","-module-name","Pulsar","-emit-dependencies","-emit-module","-emit-module-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/Pulsar.swiftmodule","-output-file-map","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/output-file-map.json","-parse-as-library","-incremental","-c","@/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/sources","-I","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules","-target","x86_64-unknown-linux-gnu","-incremental","-enable-batch-mode","-serialize-diagnostics","-index-store-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/index/store","-Onone","-enable-testing","-j12","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-Xcc","-fmodule-map-file=/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/module.modulemap","-Xcc","-I","-Xcc","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/CMIO/include","-module-cache-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/ModuleCache","-parseable-output","-parse-as-library","-emit-objc-header","-emit-objc-header-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/include/Pulsar-Swift.h","-swift-version","6","-enable-upcoming-feature","NonisolatedNonsendingByDefault","-enable-experimental-feature","Lifetimes","-enable-experimental-feature","StrictMemorySafety","-g","-Xcc","-fPIC","-Xcc","-g","-package-name","pulsar","-Xcc","-fno-omit-frame-pointer"]
+
+  "C.PulsarTests-x86_64-unknown-linux-gnu-debug.module":
+    tool: shell
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/Tests/PulsarTests/PollEventLoopTests.swift","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/swift-version-2C347D80D5C5DB36.txt","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/Pulsar.swiftmodule","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/sources"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PollEventLoopTests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/PulsarTests.swiftmodule"]
+    description: "Compiling Swift Module 'PulsarTests' (1 sources)"
+    args: ["/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc","-module-name","PulsarTests","-emit-dependencies","-emit-module","-emit-module-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/PulsarTests.swiftmodule","-output-file-map","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/output-file-map.json","-parse-as-library","-incremental","-c","@/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/sources","-I","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules","-target","x86_64-unknown-linux-gnu","-incremental","-enable-batch-mode","-serialize-diagnostics","-index-store-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/index/store","-Onone","-enable-testing","-Xfrontend","-enable-cross-import-overlays","-j12","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-Xcc","-fmodule-map-file=/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/module.modulemap","-Xcc","-I","-Xcc","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/CMIO/include","-module-cache-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/ModuleCache","-parseable-output","-parse-as-library","-swift-version","6","-enable-upcoming-feature","NonisolatedNonsendingByDefault","-enable-experimental-feature","Lifetimes","-enable-experimental-feature","StrictMemorySafety","-g","-Xcc","-fPIC","-Xcc","-g","-package-name","pulsar","-Xcc","-fno-omit-frame-pointer"]
+
+  "C.pulsarPackageDiscoveredTests-x86_64-unknown-linux-gnu-debug.module":
+    tool: shell
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.derived/PulsarTests.swift","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.derived/all-discovered-tests.swift","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/swift-version-2C347D80D5C5DB36.txt","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/PulsarTests.swiftmodule","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/sources"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/PulsarTests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/all-discovered-tests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageDiscoveredTests.swiftmodule"]
+    description: "Compiling Swift Module 'pulsarPackageDiscoveredTests' (2 sources)"
+    args: ["/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc","-module-name","pulsarPackageDiscoveredTests","-emit-dependencies","-emit-module","-emit-module-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageDiscoveredTests.swiftmodule","-output-file-map","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/output-file-map.json","-parse-as-library","-incremental","-c","@/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/sources","-I","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules","-target","x86_64-unknown-linux-gnu","-incremental","-enable-batch-mode","-serialize-diagnostics","-index-store-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/index/store","-Onone","-enable-testing","-Xfrontend","-enable-cross-import-overlays","-j12","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-Xcc","-fmodule-map-file=/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/module.modulemap","-Xcc","-I","-Xcc","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/CMIO/include","-module-cache-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/ModuleCache","-parseable-output","-parse-as-library","-emit-objc-header","-emit-objc-header-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/include/pulsarPackageDiscoveredTests-Swift.h","-g","-Xcc","-fPIC","-Xcc","-g","-package-name","pulsar","-Xcc","-fno-omit-frame-pointer"]
+
+  "C.pulsarPackageTests-x86_64-unknown-linux-gnu-debug.module":
+    tool: shell
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.derived/runner.swift","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/swift-version-2C347D80D5C5DB36.txt","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/PulsarTests.swiftmodule","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageDiscoveredTests.swiftmodule","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/sources"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/runner.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageTests.swiftmodule"]
+    description: "Compiling Swift Module 'pulsarPackageTests' (1 sources)"
+    args: ["/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc","-module-name","pulsarPackageTests","-emit-dependencies","-emit-module","-emit-module-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules/pulsarPackageTests.swiftmodule","-output-file-map","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/output-file-map.json","-parse-as-library","-incremental","-c","@/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/sources","-I","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Modules","-target","x86_64-unknown-linux-gnu","-incremental","-enable-batch-mode","-serialize-diagnostics","-index-store-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/index/store","-Onone","-enable-testing","-Xfrontend","-enable-cross-import-overlays","-j12","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-Xcc","-fmodule-map-file=/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/module.modulemap","-Xcc","-I","-Xcc","/home/akvilary/work/libs/swift/pulsar/.build/checkouts/mio/Sources/CMIO/include","-module-cache-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/ModuleCache","-parseable-output","-parse-as-library","-emit-objc-header","-emit-objc-header-path","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/include/pulsarPackageTests-Swift.h","-g","-Xcc","-fPIC","-Xcc","-g","-package-name","pulsar","-Xcc","-fno-omit-frame-pointer"]
+
+  "C.pulsarPackageTests-x86_64-unknown-linux-gnu-debug.test":
+    tool: shell
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/CMIO.build/wrapper.c.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Events.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Interest.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/MIO.swiftmodule.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Poll.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/PollConstants.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/PollError.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Ready.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Source.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Token.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/MIO.build/Waker.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PaddedAtomic.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/PollEventLoop.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/Pulsar.swiftmodule.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/Pulsar.build/ReexportMIO.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PollEventLoopTests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PulsarTests.swiftmodule.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/PulsarTests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/all-discovered-tests.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageDiscoveredTests.build/pulsarPackageDiscoveredTests.swiftmodule.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/pulsarPackageTests.swiftmodule.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/runner.swift.o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.product/Objects.LinkFileList"]
+    outputs: ["/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.xctest"]
+    description: "Linking ./.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.xctest"
+    args: ["/home/linuxbrew/.linuxbrew/Cellar/swift/6.2.4/libexec/bin/swiftc","-L","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug","-o","/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.xctest","-module-name","pulsarPackageTests","-emit-executable","-Xlinker","-rpath=$ORIGIN","@/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.product/Objects.LinkFileList","-enable-experimental-feature","Lifetimes","-enable-experimental-feature","StrictMemorySafety","-target","x86_64-unknown-linux-gnu","-g"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/home/akvilary/work/libs/swift/pulsar/Sources/Pulsar/","/home/akvilary/work/libs/swift/pulsar/Tests/PulsarTests/","/home/akvilary/work/libs/swift/pulsar/Package.swift","/home/akvilary/work/libs/swift/pulsar/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+

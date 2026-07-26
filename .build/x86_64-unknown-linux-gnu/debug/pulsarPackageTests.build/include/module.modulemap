@@ -1,0 +1,3 @@
+module pulsarPackageTests {
+    header "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/pulsarPackageTests.build/include/pulsarPackageTests-Swift.h"
+}

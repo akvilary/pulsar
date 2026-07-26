@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/master.swiftdeps"
+  },
+  "/home/akvilary/work/libs/swift/pulsar/Tests/PulsarTests/PollEventLoopTests.swift": {
+    "dependencies": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PollEventLoopTests.d",
+    "object": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PollEventLoopTests.swift.o",
+    "swiftmodule": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PollEventLoopTests~partial.swiftmodule",
+    "swift-dependencies": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PollEventLoopTests.swiftdeps",
+    "diagnostics": "/home/akvilary/work/libs/swift/pulsar/.build/x86_64-unknown-linux-gnu/debug/PulsarTests.build/PollEventLoopTests.dia"
+  }
+}
