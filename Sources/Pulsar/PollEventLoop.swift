@@ -69,6 +69,10 @@ internal struct PollChannelState {
     var fd: CInt
     var registered: Bool = false
     var pendingRead: CheckedContinuation<Int, Never>?
+    /// Absolute deadline after which a pending read is considered timed
+    /// out. Set together with `pendingRead`; cleared together with it.
+    /// Enforced by `sweepTimeouts` on each timerfd tick.
+    var readDeadline: ContinuousClock.Instant?
     /// Readiness continuation for a pending write-wait (set by
     /// `awaitWritable`). The loop NEVER stores the caller's write
     /// buffer — the caller owns it and performs every `write(2)`
@@ -76,6 +80,9 @@ internal struct PollChannelState {
     /// awaits. This mirrors tokio/mio: the reactor provides only
     /// readiness (`EPOLLOUT`), the I/O type does the syscall.
     var pendingWrite: CheckedContinuation<Bool, Never>?
+    /// Absolute deadline after which a pending write-wait is considered
+    /// timed out. Set together with `pendingWrite`; cleared together.
+    var writeDeadline: ContinuousClock.Instant?
     var watch: (@Sendable (Ready) -> Void)?
     /// Per-channel read buffer — pre-allocated, reused across
     /// keep-alive requests. Owned by the eventLoop (NOT by the
@@ -104,6 +111,21 @@ public final class PollEventLoop: @unchecked Sendable {
     // Sendable` on the previous class form silently permitted.
     private var events: Events
     private var waker: Waker?
+
+    // Periodic timer (timerfd) that wakes the loop to sweep expired
+    // read/write deadlines — the mechanism bounding per-op waits
+    // (Slowloris / write-stall defence). Created and registered in
+    // run(); one fd per loop, shared by all channels.
+    private var timerFd: CInt = -1
+    /// Token reserved for the periodic timer. Channel tokens are
+    /// `Token(channelId)` with channelId ∈ UInt32, so `UInt64.max` can
+    /// never collide. Handled explicitly in the event dispatch before
+    /// `processChannelEvent`, so it never reaches the channelId lookup.
+    private static let timerToken = Token(UInt64.max)
+    /// Sweep granularity (default 500 ms). Bounds how late a deadline
+    /// can be enforced; cheap because the sweep is O(active channels)
+    /// and runs only on each tick, never per request.
+    public var timeoutSweepInterval: Duration = .milliseconds(500)
 
     // Per-channel pending-op tracking — loop thread only.
     //
@@ -175,6 +197,19 @@ public final class PollEventLoop: @unchecked Sendable {
         // Register the cross-thread waker on the loop thread.
         self.waker = try Waker(registry: registry, token: .wakeup)
 
+        // Register the periodic timeout-sweep timer. Failure is
+        // non-fatal: the loop still serves I/O, just without bounded
+        // waits (graceful degradation to pre-timeout behaviour).
+        if let tfd = TimerFd.create() {
+            self.timerFd = tfd
+            _ = TimerFd.setPeriodic(fd: tfd, interval: timeoutSweepInterval)
+            // Level-triggered, persistent (NOT oneshot): the timer stays
+            // armed and fires once per interval until drained/closed.
+            try? registry.register(
+                fd: tfd, token: Self.timerToken, interest: .readable
+            )
+        }
+
         while !stopped.load(ordering: .acquiring) {
             // Phase 1: block on epoll_wait until at least one source is
             // ready (or the waker fires, or a signal interrupts).
@@ -195,6 +230,8 @@ public final class PollEventLoop: @unchecked Sendable {
             events.forEach { event in
                 if event.token == .wakeup {
                     handleWakeup()
+                } else if event.token == Self.timerToken {
+                    handleTimer()
                 } else {
                     processChannelEvent(event)
                 }
@@ -216,6 +253,13 @@ public final class PollEventLoop: @unchecked Sendable {
         // calls closeConnection and returns) never runs.
         recoverOrphanedContinuations()
         drainJobs()
+
+        // Tear down the timeout-sweep timer (loop-thread cleanup).
+        if timerFd >= 0 {
+            try? registry.deregister(fd: timerFd)
+            _ = Glibc.close(timerFd)
+            timerFd = -1
+        }
     }
 
     public func shutdown() {
@@ -234,6 +278,65 @@ public final class PollEventLoop: @unchecked Sendable {
     private func handleWakeup() {
         _ = waker?.reset()
         onWakeup?()
+    }
+
+    // MARK: Timeout sweep
+
+    /// Drain the periodic timerfd and resume any read/write waits whose
+    /// deadline has passed. The timer is level-triggered, so the drain
+    /// (an 8-byte `read`) is MANDATORY — without it epoll would report
+    /// the timer readable on every subsequent cycle (busy-loop).
+    @inline(__always)
+    private func handleTimer() {
+        var expirations: UInt64 = 0
+        // timerFd is non-blocking; read never blocks (returns EAGAIN if
+        // the spurious-read race loses, which we ignore).
+        _ = withUnsafeMutablePointer(to: &expirations) { ptr in
+            Glibc.read(timerFd, ptr, 8)
+        }
+        sweepTimeouts(now: ContinuousClock.now)
+    }
+
+    /// Two-phase sweep. Phase 1 is a read-only scan that collects
+    /// expired, still-pending continuations; phase 2 (after the scan,
+    /// so the dictionary is not mutated during iteration) claims each
+    /// continuation (sets the slot to `nil`), clears its deadline, and
+    /// resumes it.
+    ///
+    /// Claiming is the only synchronisation needed vs readiness
+    /// (`processChannelEvent`): both run on the loop thread, serialized,
+    /// and both null the slot before resuming — so exactly one of them
+    /// wins per continuation. `cont.resume()` schedules the Task on the
+    /// loop; it does not re-enter this state synchronously.
+    private func sweepTimeouts(now: ContinuousClock.Instant) {
+        // Phase 1: collect (read-only over `channels`).
+        var readTimedOut: [(UInt32, CheckedContinuation<Int, Never>)] = []
+        var writeTimedOut: [(UInt32, CheckedContinuation<Bool, Never>)] = []
+        for (id, state) in channels {
+            if let d = state.readDeadline, d <= now, state.pendingRead != nil,
+               let cont = state.pendingRead {
+                readTimedOut.append((id, cont))
+            }
+            if let d = state.writeDeadline, d <= now, state.pendingWrite != nil,
+               let cont = state.pendingWrite {
+                writeTimedOut.append((id, cont))
+            }
+        }
+        // Phase 2: claim + clear + resume (mutating, not iterating).
+        for (id, cont) in readTimedOut {
+            guard var state = channels[id], state.pendingRead != nil else { continue }
+            state.pendingRead = nil
+            state.readDeadline = nil
+            channels[id] = state
+            cont.resume(returning: -2)  // read-timeout sentinel
+        }
+        for (id, cont) in writeTimedOut {
+            guard var state = channels[id], state.pendingWrite != nil else { continue }
+            state.pendingWrite = nil
+            state.writeDeadline = nil
+            channels[id] = state
+            cont.resume(returning: false)  // write-timeout (≡ error → bail)
+        }
     }
 
     /// Wake the loop from any thread. The next `poll()` iteration will
@@ -303,15 +406,23 @@ public final class PollEventLoop: @unchecked Sendable {
 
     /// Await readability on `(channelId, fd)`, then read into the
     /// eventLoop's internal per-channel buffer. Returns bytes read
-    /// (0 on EOF, negative on error).
+    /// (0 on EOF, -1 on error, -2 on timeout).
     ///
     /// The buffer is owned by the eventLoop — callers access it via
     /// `getReadView(channelId:count:)` after this returns. This
     /// eliminates the need for the caller to own a raw buffer (and
     /// thus the need for @unchecked Sendable on decoder/conn types).
-    public func read(channelId: UInt32, fd: CInt) async -> Int {
+    ///
+    /// - Parameter deadline: absolute time after which an unanswered
+    ///   readiness wait is failed with `-2` (timeout). `nil` disables
+    ///   the timeout (compat). Enforced by `sweepTimeouts` on each
+    ///   timerfd tick, so granularity ≈ `timeoutSweepInterval`.
+    public func read(
+        channelId: UInt32, fd: CInt,
+        deadline: ContinuousClock.Instant? = nil
+    ) async -> Int {
         return await withCheckedContinuation { cont in
-            armRead(channelId: channelId, fd: fd, cont: cont)
+            armRead(channelId: channelId, fd: fd, cont: cont, deadline: deadline)
         }
     }
 
@@ -328,13 +439,15 @@ public final class PollEventLoop: @unchecked Sendable {
     @inline(__always)
     private func armRead(
         channelId: UInt32, fd: CInt,
-        cont: CheckedContinuation<Int, Never>
+        cont: CheckedContinuation<Int, Never>,
+        deadline: ContinuousClock.Instant?
     ) {
         var state = channels[channelId] ?? PollChannelState(fd: fd)
         state.fd = fd
         precondition(state.pendingRead == nil,
             "PollEventLoop: overlapping read on channelId=\(channelId)")
         state.pendingRead = cont
+        state.readDeadline = deadline
         rearm(channelId: channelId, state: &state)
         channels[channelId] = state
     }
@@ -393,25 +506,33 @@ public final class PollEventLoop: @unchecked Sendable {
 
     /// Await writability on `(channelId, fd)`. Arms `EPOLLOUT` (oneshot),
     /// suspends, and resumes with `true` when the socket can accept a
-    /// write, or `false` on `EPOLLERR` / `EPOLLHUP` (connection lost).
+    /// write, or `false` on `EPOLLERR` / `EPOLLHUP` / timeout.
     ///
     /// The caller issues the actual `write(2)` after this returns.
-    public func awaitWritable(channelId: UInt32, fd: CInt) async -> Bool {
+    ///
+    /// - Parameter deadline: absolute time after which an unanswered
+    ///   readiness wait is failed with `false`. `nil` disables it.
+    public func awaitWritable(
+        channelId: UInt32, fd: CInt,
+        deadline: ContinuousClock.Instant? = nil
+    ) async -> Bool {
         await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-            armWritable(channelId: channelId, fd: fd, cont: cont)
+            armWritable(channelId: channelId, fd: fd, cont: cont, deadline: deadline)
         }
     }
 
     @inline(__always)
     private func armWritable(
         channelId: UInt32, fd: CInt,
-        cont: CheckedContinuation<Bool, Never>
+        cont: CheckedContinuation<Bool, Never>,
+        deadline: ContinuousClock.Instant?
     ) {
         var state = channels[channelId] ?? PollChannelState(fd: fd)
         state.fd = fd
         precondition(state.pendingWrite == nil,
             "PollEventLoop: overlapping write on channelId=\(channelId) — previous continuation would leak")
         state.pendingWrite = cont
+        state.writeDeadline = deadline
         rearm(channelId: channelId, state: &state)
         // Single write-back after rearm (see armRead for rationale).
         channels[channelId] = state
@@ -490,6 +611,7 @@ public final class PollEventLoop: @unchecked Sendable {
         // Read readiness: issue read(2) into internal buffer, resume waiter.
         if event.isReadable, let cont = state.pendingRead {
             state.pendingRead = nil
+            state.readDeadline = nil
             let n = Glibc.read(fd, state.readBuffer!, state.readCapacity)
             cont.resume(returning: Int(n))
         }
@@ -501,6 +623,7 @@ public final class PollEventLoop: @unchecked Sendable {
         // which differs only because the loop owns the read destination.
         if event.isWritable, let cont = state.pendingWrite {
             state.pendingWrite = nil
+            state.writeDeadline = nil
             cont.resume(returning: true)
         }
 
@@ -514,25 +637,30 @@ public final class PollEventLoop: @unchecked Sendable {
         if event.ready.isError {
             if let cont = state.pendingRead {
                 state.pendingRead = nil
+                state.readDeadline = nil
                 cont.resume(returning: -1)
             }
             if let cont = state.pendingWrite {
                 state.pendingWrite = nil
+                state.writeDeadline = nil
                 cont.resume(returning: false)
             }
         } else if event.ready.isHangup {
             if let cont = state.pendingRead {
                 state.pendingRead = nil
+                state.readDeadline = nil
                 cont.resume(returning: 0)
             }
             if let cont = state.pendingWrite {
                 state.pendingWrite = nil
+                state.writeDeadline = nil
                 cont.resume(returning: false)
             }
         } else if event.ready.isReadClosed,
                   let cont = state.pendingRead {
             // EPOLLRDHUP: peer closed write side — deliver read EOF.
             state.pendingRead = nil
+            state.readDeadline = nil
             cont.resume(returning: 0)
         }
 

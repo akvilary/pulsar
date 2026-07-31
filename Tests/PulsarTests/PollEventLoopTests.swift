@@ -49,6 +49,24 @@ struct PollEventLoopTests {
             return (n, out)
         }
 
+        /// Read with an absolute deadline — used by the timeout test to
+        /// verify the timerfd sweep fails an unanswered read with -2.
+        func runReadWithDeadline(
+            loop: PollEventLoop, channelId: UInt32, fd: CInt,
+            deadline: ContinuousClock.Instant
+        ) async -> Int {
+            await loop.read(channelId: channelId, fd: fd, deadline: deadline)
+        }
+
+        /// awaitWritable with an absolute deadline — used by the timeout
+        /// test to verify a write-wait that never becomes ready fails.
+        func runAwaitWritableWithDeadline(
+            loop: PollEventLoop, channelId: UInt32, fd: CInt,
+            deadline: ContinuousClock.Instant
+        ) async -> Bool {
+            await loop.awaitWritable(channelId: channelId, fd: fd, deadline: deadline)
+        }
+
         /// Drive one write followed by one read on the same socket
         /// pair. Sequential — the loop processes one Task at a time
         /// per iteration (mirrors IORingEventLoop's echoLoop pattern;
@@ -239,6 +257,69 @@ struct PollEventLoopTests {
         // If we got here, the Task executed on (or was drained by)
         // the loop. The precondition is that executorPreference
         // does not hang and does not crash.
+    }
+
+    // MARK: - Readiness timeouts (timerfd sweep)
+
+    @Test("read with a deadline returns -2 when no data arrives")
+    func readDeadlineTimesOut() async throws {
+        let loop = try PollEventLoop()
+        loop.timeoutSweepInterval = .milliseconds(50)  // tight for a fast test
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        try await Task.sleep(for: .milliseconds(30))
+
+        let channelId = loop.registerChannel()
+        // Deadline 200 ms out; sweep granularity 50 ms ⇒ fires ≤ ~250 ms.
+        let deadline = ContinuousClock.now + .milliseconds(200)
+
+        let pinned = LoopPinned(loop.cachedExecutor)
+        let n = await pinned.runReadWithDeadline(
+            loop: loop, channelId: channelId, fd: b, deadline: deadline)
+
+        // We never write to `a`, so the read can only complete via the
+        // sweep failing it on deadline.
+        #expect(n == -2, "timed-out read must return -2, got \(n)")
+    }
+
+    @Test("awaitWritable with a deadline returns false when never ready")
+    func awaitWritableDeadlineTimesOut() async throws {
+        let loop = try PollEventLoop()
+        loop.timeoutSweepInterval = .milliseconds(50)
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        try await Task.sleep(for: .milliseconds(30))
+
+        // Fill the socket send buffer so the write side is NOT writable,
+        // forcing awaitWritable to wait (and then time out). A socketpair
+        // buffer is ~200 KB; write until EAGAIN.
+        var filler = [UInt8](repeating: 0x41, count: 65_536)
+        while filler.withUnsafeBufferPointer({ Glibc.write(a, $0.baseAddress!, $0.count) }) > 0 {}
+
+        let channelId = loop.registerChannel()
+        let deadline = ContinuousClock.now + .milliseconds(200)
+
+        let pinned = LoopPinned(loop.cachedExecutor)
+        let ok = await pinned.runAwaitWritableWithDeadline(
+            loop: loop, channelId: channelId, fd: a, deadline: deadline)
+
+        #expect(ok == false, "timed-out write-wait must return false")
     }
 }
 
