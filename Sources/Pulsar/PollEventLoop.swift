@@ -73,7 +73,7 @@ internal struct PollChannelState {
     var watch: (@Sendable (Ready) -> Void)?
     /// Per-channel read buffer — pre-allocated, reused across
     /// keep-alive requests. Owned by the eventLoop (NOT by the
-    /// decoder). Eliminates @unchecked on H1Decoder + ConnState.
+    /// decoder). Eliminates @unchecked on H1Conn + ConnState.
     var readBuffer: UnsafeMutablePointer<UInt8>?
     var readCapacity: Int = 8192
 }
