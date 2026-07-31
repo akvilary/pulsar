@@ -402,6 +402,26 @@ public final class PollEventLoop: @unchecked Sendable {
         if let buf = state.readBuffer { buf.deallocate() }
     }
 
+    /// Cancel the watch channel registered for `fd` — find its
+    /// channelId (one fd maps to at most one channel: epoll registers
+    /// a fd once) and run `cancelChannel` on it, which deregisters the
+    /// fd from epoll and releases the stored watch closure. O(active
+    /// channels); intended for the shutdown path (e.g. stopping a
+    /// level-triggered listener so it stops firing readability and
+    /// busy-looping). Must be called on the loop thread, like
+    /// `cancelChannel`. No-op if `fd` has no channel.
+    public func cancelWatch(fd: CInt) {
+        // Read-only scan first; the mutation (`cancelChannel`) runs
+        // only after the iteration ends, so `channels` is never
+        // mutated during iteration.
+        var target: UInt32? = nil
+        for (id, state) in channels where state.fd == fd {
+            target = id
+            break
+        }
+        if let id = target { cancelChannel(id) }
+    }
+
     // MARK: Async read
 
     /// Await readability on `(channelId, fd)`, then read into the
