@@ -69,7 +69,13 @@ internal struct PollChannelState {
     var fd: CInt
     var registered: Bool = false
     var pendingRead: CheckedContinuation<Int, Never>?
-    var pendingWrite: (CheckedContinuation<Int, Never>, UnsafeRawBufferPointer)?
+    /// Readiness continuation for a pending write-wait (set by
+    /// `awaitWritable`). The loop NEVER stores the caller's write
+    /// buffer — the caller owns it and performs every `write(2)`
+    /// itself, on the loop thread, in synchronous sections between
+    /// awaits. This mirrors tokio/mio: the reactor provides only
+    /// readiness (`EPOLLOUT`), the I/O type does the syscall.
+    var pendingWrite: CheckedContinuation<Bool, Never>?
     var watch: (@Sendable (Ready) -> Void)?
     /// Per-channel read buffer — pre-allocated, reused across
     /// keep-alive requests. Owned by the eventLoop (NOT by the
@@ -287,7 +293,7 @@ public final class PollEventLoop: @unchecked Sendable {
     public func cancelChannel(_ channelId: UInt32) {
         guard let state = channels.removeValue(forKey: channelId) else { return }
         if let cont = state.pendingRead  { cont.resume(returning: -1) }
-        if let (cont, _) = state.pendingWrite { cont.resume(returning: -1) }
+        if let cont = state.pendingWrite { cont.resume(returning: false) }
         if state.registered { try? registry.deregister(fd: state.fd) }
         // Free per-channel read buffer.
         if let buf = state.readBuffer { buf.deallocate() }
@@ -334,34 +340,78 @@ public final class PollEventLoop: @unchecked Sendable {
     }
 
     // MARK: Async write
+    //
+    // Reactor contract: the loop is a *readiness* reactor for writes.
+    // It performs NO `write(2)` itself and stores NO caller buffer.
+    // The caller does every `write(2)` in its own synchronous context
+    // (on the loop thread); on `EAGAIN` it awaits `awaitWritable`,
+    // which arms `EPOLLOUT` oneshot and resumes the caller when the
+    // socket has space. This is the tokio/mio model and the symmetric
+    // counterpart of the read path — the difference (loop reads,
+    // caller writes) follows buffer ownership: the loop owns the read
+    // destination buffer, the caller owns the write source buffer.
 
-    /// Await writability on `(channelId, fd)`, then perform a single
-    /// `write(2)` from `buffer`. Returns bytes written (negative on
-    /// error).
+    /// Optimistic `write(2)` loop over `buffer`; on `EAGAIN` arms
+    /// `EPOLLOUT` and awaits readiness via `awaitWritable`. Returns
+    /// total bytes written (0..buffer.count).
     ///
-    /// - Precondition: the caller MUST ensure no other `write` is
-    ///   in flight on the same `channelId`. See `read()` for the
-    ///   rationale — the same invariant applies symmetrically here.
+    /// Runs entirely on the caller's executor (the loop thread for
+    /// loop-pinned callers). The fast path — socket buffer has room —
+    /// never suspends: the optimistic `write(2)` succeeds and the loop
+    /// returns without crossing an await. Only a full socket buffer
+    /// triggers `awaitWritable`, which suspends this Task while the
+    /// loop serves other connections.
+    ///
+    /// - Precondition: the caller MUST own `buffer` for the duration
+    ///   of this call (across any internal await). The pointer is
+    ///   dereferenced only inside synchronous `write(2)` attempts.
+    /// - Precondition: no other write wait may be in flight on the
+    ///   same `channelId`.
     public func write(
         channelId: UInt32, fd: CInt,
         from buffer: UnsafeRawBufferPointer
     ) async -> Int {
-        return await withCheckedContinuation { cont in
-            armWrite(channelId: channelId, fd: fd, cont: cont, buffer: buffer)
+        var offset = 0
+        while offset < buffer.count {
+            let n = Glibc.write(
+                fd, buffer.baseAddress!.advanced(by: offset),
+                buffer.count - offset
+            )
+            if n > 0 { offset += Int(n); continue }
+            if n == 0 { break }          // socket: shouldn't happen
+            if errno == EINTR { continue }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                if !(await awaitWritable(channelId: channelId, fd: fd)) {
+                    break                 // error / hangup
+                }
+                continue
+            }
+            break                         // EPIPE / EBADF / ...
+        }
+        return offset
+    }
+
+    /// Await writability on `(channelId, fd)`. Arms `EPOLLOUT` (oneshot),
+    /// suspends, and resumes with `true` when the socket can accept a
+    /// write, or `false` on `EPOLLERR` / `EPOLLHUP` (connection lost).
+    ///
+    /// The caller issues the actual `write(2)` after this returns.
+    public func awaitWritable(channelId: UInt32, fd: CInt) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            armWritable(channelId: channelId, fd: fd, cont: cont)
         }
     }
 
     @inline(__always)
-    private func armWrite(
+    private func armWritable(
         channelId: UInt32, fd: CInt,
-        cont: CheckedContinuation<Int, Never>,
-        buffer: UnsafeRawBufferPointer
+        cont: CheckedContinuation<Bool, Never>
     ) {
         var state = channels[channelId] ?? PollChannelState(fd: fd)
         state.fd = fd
         precondition(state.pendingWrite == nil,
             "PollEventLoop: overlapping write on channelId=\(channelId) — previous continuation would leak")
-        state.pendingWrite = (cont, buffer)
+        state.pendingWrite = cont
         rearm(channelId: channelId, state: &state)
         // Single write-back after rearm (see armRead for rationale).
         channels[channelId] = state
@@ -411,9 +461,9 @@ public final class PollEventLoop: @unchecked Sendable {
                 state.pendingRead = nil
                 cont.resume(returning: -1)
             }
-            if let (cont, _) = state.pendingWrite {
+            if let cont = state.pendingWrite {
                 state.pendingWrite = nil
-                cont.resume(returning: -1)
+                cont.resume(returning: false)
             }
         }
     }
@@ -444,29 +494,44 @@ public final class PollEventLoop: @unchecked Sendable {
             cont.resume(returning: Int(n))
         }
 
-        // Write readiness: issue write(2) and resume the waiter.
-        if event.isWritable, let (cont, buf) = state.pendingWrite {
+        // Write readiness: the caller owns the buffer and performs the
+        // `write(2)` itself after resuming. Here we only signal
+        // writability (`true`). No buffer is dereferenced on the loop
+        // side — the write-side symmetric counterpart of the read path,
+        // which differs only because the loop owns the read destination.
+        if event.isWritable, let cont = state.pendingWrite {
             state.pendingWrite = nil
-            let n = Glibc.write(fd, buf.baseAddress!, buf.count)
-            cont.resume(returning: Int(n))
+            cont.resume(returning: true)
         }
 
-        // Error / EOF handling. EPOLLHUP-without-IN is read-side EOF,
-        // surfaced as a 0-byte read (mirrors io_uring recv on a closed
-        // socket). EPOLLERR surfaces as -1 to any remaining waiter.
+        // Error / EOF handling. EPOLLERR surfaces as failure to any
+        // remaining waiter (read: -1, write: false). EPOLLHUP (full
+        // hangup) without EPOLLERR delivers read-side EOF (0) and
+        // write-side failure (false) — note this also catches the
+        // EPOLLHUP-without-IN case that `isReadClosed` would otherwise
+        // claim. EPOLLRDHUP (peer half-close) alone does NOT fail a
+        // pending write: the local side may still flush.
         if event.ready.isError {
             if let cont = state.pendingRead {
                 state.pendingRead = nil
                 cont.resume(returning: -1)
             }
-            if let (cont, _) = state.pendingWrite {
+            if let cont = state.pendingWrite {
                 state.pendingWrite = nil
-                cont.resume(returning: -1)
+                cont.resume(returning: false)
+            }
+        } else if event.ready.isHangup {
+            if let cont = state.pendingRead {
+                state.pendingRead = nil
+                cont.resume(returning: 0)
+            }
+            if let cont = state.pendingWrite {
+                state.pendingWrite = nil
+                cont.resume(returning: false)
             }
         } else if event.ready.isReadClosed,
                   let cont = state.pendingRead {
-            // Peer closed write side (EPOLLRDHUP) or hung up without
-            // data: deliver EOF.
+            // EPOLLRDHUP: peer closed write side — deliver read EOF.
             state.pendingRead = nil
             cont.resume(returning: 0)
         }
@@ -486,9 +551,9 @@ public final class PollEventLoop: @unchecked Sendable {
                 state.pendingRead = nil
                 cont.resume(returning: -1)
             }
-            if let (cont, _) = state.pendingWrite {
+            if let cont = state.pendingWrite {
                 state.pendingWrite = nil
-                cont.resume(returning: -1)
+                cont.resume(returning: false)
             }
         }
         // Releases any held watch closures (e.g. the listener's accept
