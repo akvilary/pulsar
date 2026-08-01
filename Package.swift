@@ -18,7 +18,7 @@ let package = Package(
         .library(name: "Pulsar", targets: ["Pulsar"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/akvilary/mio.git", from: "0.2.0"),
+        .package(path: "../mio"),
     ],
     targets: [
         .target(
