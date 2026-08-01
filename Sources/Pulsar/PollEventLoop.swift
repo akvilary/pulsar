@@ -144,6 +144,13 @@ public final class PollEventLoop: @unchecked Sendable {
     private var jobLock = pthread_spinlock_t()
     private let loopThreadId = Atomic<UInt>(0)
 
+    // Loop-thread scratch for `drainJobs`. Swapping `loopJobs` into it
+    // (O(1) CoW buffer exchange) avoids the CoW deep-copy that the
+    // previous `var jobs = loopJobs; loopJobs.removeAll()` form
+    // triggered, and keeps the buffer's capacity recycled across
+    // drain cycles. Touched only on the loop thread, like `loopJobs`.
+    private var drainBuffer: [UnownedJob] = []
+
     // Loop state.
     private let stopped = Atomic<Bool>(false)
     private var consecutiveErrors: Int = 0
@@ -152,7 +159,16 @@ public final class PollEventLoop: @unchecked Sendable {
     public let overflowEvents = PaddedAtomicInt64()
 
     // User hook invoked from the loop thread after the waker fires.
-    public var onWakeup: (@Sendable () -> Void)?
+    //
+    // Backed by a Mutex so a `set` from any thread cannot race with
+    // the loop thread's read in `handleWakeup`. The callback itself
+    // is invoked OUTSIDE the lock (see `handleWakeup`) so a callback
+    // that re-enters the loop (enqueue, etc.) cannot self-deadlock.
+    private let onWakeupLock = Mutex<(@Sendable () -> Void)?>(nil)
+    public var onWakeup: (@Sendable () -> Void)? {
+        get { onWakeupLock.withLock { $0 } }
+        set { onWakeupLock.withLock { $0 = newValue } }
+    }
 
     // UnownedSerialExecutor / UnownedTaskExecutor handles.
     //
@@ -277,7 +293,11 @@ public final class PollEventLoop: @unchecked Sendable {
     @inline(__always)
     private func handleWakeup() {
         _ = waker?.reset()
-        onWakeup?()
+        // Read the callback under the lock, invoke it OUTSIDE so a
+        // re-entrant callback (e.g. one that enqueues on the loop)
+        // cannot take the same Mutex recursively.
+        let cb = onWakeupLock.withLock { $0 }
+        cb?()
     }
 
     // MARK: Timeout sweep
@@ -723,22 +743,27 @@ public final class PollEventLoop: @unchecked Sendable {
     /// blocking epoll_wait means "forever".
     private func drainJobs() {
         while true {
-            var jobs = loopJobs
-            loopJobs.removeAll(keepingCapacity: true)
+            // Move the loop-local queue into the scratch buffer via an
+            // O(1) CoW buffer exchange — no element copy, and the
+            // buffer's capacity is recycled across drain cycles. The
+            // previous `var jobs = loopJobs; loopJobs.removeAll()`
+            // form triggered a CoW deep-copy of every queued job
+            // because both names shared the buffer at mutation time.
+            // loopJobs is loop-thread-only, so no lock.
+            swap(&drainBuffer, &loopJobs)
 
             if !poolJobs.isEmpty {
                 pthread_spin_lock(&jobLock)
-                jobs.append(contentsOf: poolJobs)
+                drainBuffer.append(contentsOf: poolJobs)
                 poolJobs.removeAll(keepingCapacity: true)
                 pthread_spin_unlock(&jobLock)
             }
-            if jobs.isEmpty { return }
-            if jobs.count > 1 {
-            }
+            if drainBuffer.isEmpty { return }
 
-            for job in jobs {
+            for job in drainBuffer {
                 job.runSynchronously(on: cachedExecutor)
             }
+            drainBuffer.removeAll(keepingCapacity: true)
         }
     }
 
