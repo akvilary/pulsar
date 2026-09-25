@@ -29,7 +29,7 @@ Linux only at the syscall level (`epoll`, `eventfd`, `timerfd`). All sources are
 ## Installation
 
 ```swift
-.package(url: "https://github.com/akvilary/pulsar.git", from: "0.1.0")
+.package(url: "https://github.com/akvilary/pulsar.git", from: "0.1.1")
 ```
 
 ```swift
