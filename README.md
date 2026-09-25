@@ -73,6 +73,14 @@ interest, and when the kernel reports the fd ready the loop performs the syscall
 **on the loop thread** and resumes the continuation — mirroring io_uring's
 "kernel does the I/O" model without the kernel-side buffer cost.
 
+Channels are tracked in a dense generation-guarded slab (the tokio `slab` model):
+`registerChannel()` returns an opaque `ChannelId` — `(generation << 32) | slot`
+packed into the epoll token — so token → state resolution on the hot path is an
+AND, a shift and two compares (no hashing, no exclusivity accessors), and stale
+events for cancelled channels are dropped by the generation check. Slots are
+reused LIFO under churn; a handle that outlives its `cancelChannel` traps with a
+precondition instead of acting on the slot's new occupant.
+
 ```swift
 // Inside a Task pinned to the loop:
 let n = await loop.read(channelId: id, fd: fd)            // bytes; 0=EOF, -1=err, -2=timeout

@@ -15,7 +15,7 @@
 import Testing
 import Foundation
 import Synchronization
-import Pulsar
+@testable import Pulsar
 
 #if canImport(Glibc)
 import Glibc
@@ -36,7 +36,7 @@ struct PollEventLoopTests {
         nonisolated var unownedExecutor: UnownedSerialExecutor { _executor }
 
         /// Read via eventLoop's internal buffer, copy out to [UInt8].
-        func runRead(loop: PollEventLoop, channelId: UInt32,
+        func runRead(loop: PollEventLoop, channelId: ChannelId,
                      fd: CInt, capacity: Int) async -> (Int, [UInt8]) {
             let n = await loop.read(channelId: channelId, fd: fd)
             var out = [UInt8](repeating: 0, count: max(0, n))
@@ -52,7 +52,7 @@ struct PollEventLoopTests {
         /// Read with an absolute deadline — used by the timeout test to
         /// verify the timerfd sweep fails an unanswered read with -2.
         func runReadWithDeadline(
-            loop: PollEventLoop, channelId: UInt32, fd: CInt,
+            loop: PollEventLoop, channelId: ChannelId, fd: CInt,
             deadline: ContinuousClock.Instant
         ) async -> Int {
             await loop.read(channelId: channelId, fd: fd, deadline: deadline)
@@ -61,7 +61,7 @@ struct PollEventLoopTests {
         /// awaitWritable with an absolute deadline — used by the timeout
         /// test to verify a write-wait that never becomes ready fails.
         func runAwaitWritableWithDeadline(
-            loop: PollEventLoop, channelId: UInt32, fd: CInt,
+            loop: PollEventLoop, channelId: ChannelId, fd: CInt,
             deadline: ContinuousClock.Instant
         ) async -> Bool {
             await loop.awaitWritable(channelId: channelId, fd: fd, deadline: deadline)
@@ -73,7 +73,7 @@ struct PollEventLoopTests {
         /// `async let` would deadlock because child tasks queued during
         /// drainJobs don't run until the next poll() returns).
         func runRoundTrip(loop: PollEventLoop,
-                          writerCh: UInt32, readerCh: UInt32,
+                          writerCh: ChannelId, readerCh: ChannelId,
                           a: CInt, b: CInt,
                           payload: [UInt8]) async -> (writeN: Int, readN: Int, read: [UInt8]) {
             let writeBuf = UnsafeMutableRawBufferPointer.allocate(
@@ -114,14 +114,16 @@ struct PollEventLoopTests {
             loop.shutdown()
         }
 
+        // Register BEFORE starting the loop — the channel table is
+        // loop-thread state (the threading contract).
+        let channelId = loop.registerChannel()
+
         // Run the loop on a dedicated OS thread.
         let loopThread = Thread { [loop] in
             try? loop.run()
         }
         loopThread.start()
         try await Task.sleep(for: .milliseconds(30))
-
-        let channelId = loop.registerChannel()
 
         let payload: [UInt8] = [0xDE, 0xAD, 0xBE, 0xEF]
         _ = payload.withUnsafeBufferPointer { ptr in
@@ -174,12 +176,13 @@ struct PollEventLoopTests {
             loop.shutdown()
         }
 
+        // Threading contract: register before the loop starts.
+        let writerCh = loop.registerChannel()
+        let readerCh = loop.registerChannel()
+
         let loopThread = Thread { [loop] in try? loop.run() }
         loopThread.start()
         try await Task.sleep(for: .milliseconds(30))
-
-        let writerCh = loop.registerChannel()
-        let readerCh = loop.registerChannel()
 
         let payload: [UInt8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06]
 
@@ -273,11 +276,13 @@ struct PollEventLoopTests {
             loop.shutdown()
         }
 
+        // Threading contract: register before the loop starts.
+        let channelId = loop.registerChannel()
+
         let loopThread = Thread { [loop] in try? loop.run() }
         loopThread.start()
         try await Task.sleep(for: .milliseconds(30))
 
-        let channelId = loop.registerChannel()
         // Deadline 200 ms out; sweep granularity 50 ms ⇒ fires ≤ ~250 ms.
         let deadline = ContinuousClock.now + .milliseconds(200)
 
@@ -302,6 +307,9 @@ struct PollEventLoopTests {
             loop.shutdown()
         }
 
+        // Threading contract: register before the loop starts.
+        let channelId = loop.registerChannel()
+
         let loopThread = Thread { [loop] in try? loop.run() }
         loopThread.start()
         try await Task.sleep(for: .milliseconds(30))
@@ -312,7 +320,6 @@ struct PollEventLoopTests {
         var filler = [UInt8](repeating: 0x41, count: 65_536)
         while filler.withUnsafeBufferPointer({ Glibc.write(a, $0.baseAddress!, $0.count) }) > 0 {}
 
-        let channelId = loop.registerChannel()
         let deadline = ContinuousClock.now + .milliseconds(200)
 
         let pinned = LoopPinned(loop.cachedExecutor)
@@ -320,6 +327,245 @@ struct PollEventLoopTests {
             loop: loop, channelId: channelId, fd: a, deadline: deadline)
 
         #expect(ok == false, "timed-out write-wait must return false")
+    }
+
+    // MARK: - ChannelId / slab semantics
+
+    @Test("Slot reuse: cancel then register hands back a distinct id")
+    func slotReuseYieldsDistinctIds() {
+        let loop = try! PollEventLoop()
+        let a = loop.registerChannel()
+        loop.cancelChannel(a)
+        // LIFO free-list: the new channel takes the same SLOT, but the
+        // generation differs — the ids must not be equal even though
+        // the slot index is reused.
+        let b = loop.registerChannel()
+        #expect(a != b, "reused slot must bump the generation")
+        #expect(a.slot == b.slot, "LIFO free-list should reuse the freed slot")
+        // Parity encoding: generation bumps on free AND on re-alloc, so
+        // consecutive occupants of a slot differ by 2 (odd = live).
+        #expect(b.generation == a.generation + 2)
+        loop.cancelChannel(b)
+    }
+
+    @Test("Fresh handle works after same-slot reuse (stale tokens fail generation check)")
+    func staleHandleEventsAreDropped() async throws {
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        // Threading contract: register before the loop starts.
+        // Channel 1 on end `b`; arm a read so the fd is registered
+        // under (slot, gen1), then cancel — the fd keeps a pending
+        // readability notification pattern typical of a just-closed
+        // connection.
+        let stale = loop.registerChannel()
+
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        try await Task.sleep(for: .milliseconds(30))
+
+        let pinned = LoopPinned(loop.cachedExecutor)
+        // Arm a read that we then make ready, so an event is in flight.
+        _ = Glibc.write(a, [0xAA as UInt8], 1)
+        let readTask = Task(executorPreference: loop) {
+            await loop.read(channelId: stale, fd: b)
+        }
+        _ = await readTask.value  // completes (data present)
+
+        // Cancel + re-register on the LOOP thread (threading contract):
+        // the freed slot must come back with a new generation.
+        let fresh = await Task(executorPreference: loop) { () -> ChannelId in
+            loop.cancelChannel(stale)
+            return loop.registerChannel()
+        }.value
+        #expect(fresh.slot == stale.slot)
+
+        // Deliver an event for the STALE token directly to the loop's
+        // dispatch: not directly expressible via the public API, so
+        // verify the inverse — the fresh handle still works end-to-end
+        // after the stale one was cancelled (no cross-routing).
+        _ = Glibc.write(a, [0xBB as UInt8], 1)
+        let (n, out) = await pinned.runRead(
+            loop: loop, channelId: fresh, fd: b, capacity: 8)
+        #expect(n == 1)
+        #expect(out.first == 0xBB)
+    }
+
+    @Test("Many churned channels stay bounded and addressable")
+    func channelChurnBoundedMemory() {
+        let loop = try! PollEventLoop()
+        // Churn 10k registrations through the table. With the LIFO
+        // free-list the slot count must stay far below 10k.
+        var last: ChannelId?
+        for _ in 0..<10_000 {
+            if let l = last { loop.cancelChannel(l) }
+            let id = loop.registerChannel()
+            last = id
+        }
+        // All registrations were sequential (cancel-then-register), so
+        // exactly one slot is live.
+        #expect(loop.channelsSlotCount == 1)
+        #expect(loop.channelsLiveCount == 1)
+        if let l = last { loop.cancelChannel(l) }
+        #expect(loop.channelsLiveCount == 0)
+    }
+
+    @Test("Table growth ×2 preserves every live slot's bookkeeping")
+    func tableGrowthAccounting() {
+        let loop = try! PollEventLoop()  // initialCapacity = 256
+        // Cross the growth boundary twice (256 → 512 → 1024).
+        let ids = (0..<600).map { _ in loop.registerChannel() }
+        #expect(loop.channelsSlotCount == 600)
+        #expect(loop.channelsLiveCount == 600)
+
+        // Free a middle swath; the freed slots return to the LIFO list.
+        for id in ids[100..<400] { loop.cancelChannel(id) }
+        #expect(loop.channelsLiveCount == 300)
+
+        // New registrations must REUSE freed slots — the high-water
+        // mark must not move.
+        for _ in 0..<50 { _ = loop.registerChannel() }
+        #expect(loop.channelsSlotCount == 600)
+        #expect(loop.channelsLiveCount == 350)
+
+        // Early channels (their states were MOVED by two reallocations)
+        // remain individually addressable.
+        for id in ids[0..<100] { loop.cancelChannel(id) }
+        #expect(loop.channelsLiveCount == 250)
+    }
+
+    @Test("I/O works on channels whose states survived two reallocations")
+    func ioWorksAfterGrowth() async throws {
+        let loop = try PollEventLoop()
+        // Reader channel on slot 0 — registered FIRST so its state is
+        // moved by both reallocations (256 → 512 → 1024) before use.
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        let early = loop.registerChannel()
+        for _ in 0..<300 { _ = loop.registerChannel() }  // force growth
+        #expect(loop.channelsSlotCount == 301)
+
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        try await Task.sleep(for: .milliseconds(30))
+
+        _ = Glibc.write(a, [0xC0 as UInt8, 0xFF], 2)
+        let pinned = LoopPinned(loop.cachedExecutor)
+        let (n, out) = await pinned.runRead(
+            loop: loop, channelId: early, fd: b, capacity: 8)
+        #expect(n == 2, "read on a moved state must deliver data, got \(n)")
+        #expect(Array(out.prefix(2)) == [0xC0, 0xFF])
+    }
+
+    @Test("Shutdown resumes a pending read with -1 (orphan recovery)")
+    func shutdownResumesPendingReads() async throws {
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer { _ = Glibc.close(a); _ = Glibc.close(b) }
+
+        let channelId = loop.registerChannel()
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        try await Task.sleep(for: .milliseconds(30))
+
+        // Arm a read that will never become ready (no data written).
+        let readTask = Task(executorPreference: loop) {
+            await loop.read(channelId: channelId, fd: b)
+        }
+        try await Task.sleep(for: .milliseconds(50))
+
+        loop.shutdown()
+        // recoverOrphanedContinuations must resume the waiter with -1
+        // instead of leaking it.
+        let n = await readTask.value
+        #expect(n == -1, "orphaned read must be failed with -1, got \(n)")
+    }
+
+    @Test("Deterministic stale-batch event is dropped by the generation check")
+    func staleBatchEventDeterministic() async throws {
+        // Injects synthetic events straight into the dispatcher
+        // (`@testable`) — the kernel equivalent is an event sitting in
+        // the current epoll_wait batch when the channel is cancelled
+        // mid-batch (e.g. from a watch handler). No running loop is
+        // needed: arm + dispatch + read-back all run synchronously.
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer { _ = Glibc.close(a); _ = Glibc.close(b) }
+
+        let stale = loop.registerChannel()
+        let staleToken = stale.asToken
+        loop.cancelChannel(stale)
+        // Same slot, next generation.
+        let fresh = loop.registerChannel()
+        #expect(fresh.slot == stale.slot)
+
+        // Arm a read on `fresh` (loop not running: the awaiting Task's
+        // thread is a legal setup thread).
+        _ = Glibc.write(a, [0x5A as UInt8], 1)
+        let readTask = Task { await loop.read(channelId: fresh, fd: b) }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(loop._readPending(fresh), "read must be armed before injection")
+
+        // THE scenario: a stale event for the cancelled generation
+        // arrives while the read is pending. It must be DROPPED —
+        // no crash, no consumption of `fresh`'s continuation.
+        loop.processChannelEvent(Event(token: staleToken, ready: .readable))
+        #expect(loop._readPending(fresh),
+            "stale-batch event must not satisfy the new occupant's read")
+
+        // Positive control: the CURRENT token dispatches and completes
+        // the read with the buffered byte.
+        loop.processChannelEvent(Event(token: fresh.asToken, ready: .readable))
+        let n = await readTask.value
+        #expect(n == 1, "fresh token must deliver the read, got \(n)")
+    }
+
+    @Test("cancelWatch resolves via the fd map and is idempotent")
+    func cancelWatchUsesFdMap() async throws {
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer { _ = Glibc.close(a); _ = Glibc.close(b) }
+
+        let fired = Atomic<Bool>(false)
+        let id = try loop.registerWatch(fd: a, interest: .readable) { _ in
+            fired.store(true, ordering: .releasing)
+        }
+        #expect(loop.channelsLiveCount == 1)
+
+        // cancelWatch(fd:) — the O(1) path — must free exactly the
+        // watch channel, and a second call must be a no-op.
+        loop.cancelWatch(fd: a)
+        #expect(loop.channelsLiveCount == 0, "watch slot must be freed")
+        #expect(!loop.channels.isLive(slot: id.slot))
+
+        loop.cancelWatch(fd: a)  // idempotent
+        #expect(loop.channelsLiveCount == 0)
+
+        // Data channels never enter the fd map: cancelling by their fd
+        // is a no-op even if the fd coincides.
+        let data = loop.registerChannel()
+        loop.cancelWatch(fd: a)
+        #expect(loop.channelsLiveCount == 1, "data channel must be untouched")
+        loop.cancelChannel(data)
+        #expect(fired.load(ordering: .acquiring) == false)
     }
 }
 

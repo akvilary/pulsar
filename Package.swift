@@ -35,6 +35,14 @@ let package = Package(
             path: "Tests/PulsarTests",
             swiftSettings: baseSwiftSettings
         ),
+        // A/B benchmark harness for the channel-table hot path
+        // (see Sources/PulsarBench/main.swift header).
+        .executableTarget(
+            name: "PulsarBench",
+            dependencies: ["Pulsar"],
+            path: "Sources/PulsarBench",
+            swiftSettings: baseSwiftSettings
+        ),
     ]
 )
 

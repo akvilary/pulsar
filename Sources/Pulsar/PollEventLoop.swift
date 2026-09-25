@@ -64,7 +64,19 @@ import Glibc
 ///     `watch` with the observed `Ready` and returns. The fd stays armed
 ///     with the caller-supplied interest (typically level-triggered and
 ///     persistent, e.g. a listening socket drained with `accept4`).
-@usableFromInline
+/// - Note: hot-path layout reality (verified in disassembly): because
+/// this struct stores resilient members (`ContinuousClock.Instant`,
+/// `Optional<CheckedContinuation>` — both non-frozen stdlib/Foundation
+/// types), its size and field offsets are runtime-computed from type
+/// metadata even inside this module. The cost is one cached metadata
+/// fetch + a handful of same-cache-line offset loads per event
+/// (~5-8 ns, pipelined away against the ~1 µs read syscall that
+/// follows). `@frozen`/`@usableFromInline`/removing `@inline(__always)`
+/// do not change this (tried); the only full elimination is a
+/// struct-of-arrays slab with trivially-laid-out fields and raw-word
+/// continuation storage — deliberately not taken (fragility outweighs
+/// the sub-1% gain). The watch/data dispatch decision itself reads the
+/// slab's parallel `watchFlags` byte array and IS fully static.
 internal struct PollChannelState {
     var fd: CInt
     var registered: Bool = false
@@ -118,9 +130,12 @@ public final class PollEventLoop: @unchecked Sendable {
     // run(); one fd per loop, shared by all channels.
     private var timerFd: CInt = -1
     /// Token reserved for the periodic timer. Channel tokens are
-    /// `Token(channelId)` with channelId ∈ UInt32, so `UInt64.max` can
-    /// never collide. Handled explicitly in the event dispatch before
-    /// `processChannelEvent`, so it never reaches the channelId lookup.
+    /// `(generation << 32) | slot` with generation ≥ 1 — so `UInt64.max`
+    /// (all bits set, needs an impossible 4G-slot table at the highest
+    /// generation) can never collide. Handled explicitly in the event
+    /// dispatch before `processChannelEvent`, so it never reaches the
+    /// channel lookup. Likewise `Token.wakeup == 0` can never collide:
+    /// a handed-out generation is never 0.
     private static let timerToken = Token(UInt64.max)
     /// Sweep granularity (default 500 ms). Bounds how late a deadline
     /// can be enforced; cheap because the sweep is O(active channels)
@@ -129,14 +144,23 @@ public final class PollEventLoop: @unchecked Sendable {
 
     // Per-channel pending-op tracking — loop thread only.
     //
-    // INVARIANT: `PollChannelState` is a value type — any code path that
-    // reads a state from this dict, mutates the local copy, and resumes
-    // continuations MUST persist the mutated copy back via
-    // `channels[channelId] = state` before returning. `rearm(state:)`
-    // does NOT read from this dict and does NOT persist its own
-    // mutations; the caller owns the single write-back after rearm.
-    private var nextChannelId: UInt32 = 1
-    private var channels: [UInt32: PollChannelState] = [:]
+    // Dense slab (see `ChannelSlab`): O(1) token → state resolution on
+    // the hot path (one AND, one shift, one generation compare — no
+    // hashing, no exclusivity accessors, no copy-out/write-back). The
+    // epoll token IS the handle: `(generation << 32) | slot`, so
+    // events for a cancelled channel fail the generation check and
+    // are dropped, exactly like the dictionary lookup miss this
+    // replaces — while slot reuse keeps memory bounded under churn.
+    //
+    // INVARIANT: state is mutated IN PLACE through the slot pointer.
+    // Continuation fields are nilled in the slot BEFORE `resume` (a
+    // resumed Task may re-enter `armRead`/`armWritable` for the same
+    // slot from `drainJobs`). The slot pointer must not be held
+    // across a `watch` handler call — the handler may cancel this
+    // very slot (see `processChannelEvent`).
+    //
+    // Internal (not private) for white-box tests via `@testable`.
+    internal let channels = ChannelSlab(initialCapacity: 256)
 
     // Cross-thread job queue (SerialExecutor surface).
     private var loopJobs: [UnownedJob] = []
@@ -157,6 +181,15 @@ public final class PollEventLoop: @unchecked Sendable {
 
     // Stats.
     public let overflowEvents = PaddedAtomicInt64()
+
+    /// Number of currently-live channels (gauge; loop thread or a
+    /// racy cross-thread read is acceptable for monitoring).
+    public var channelsLiveCount: Int { channels.liveCount }
+
+    /// Number of slots ever touched by the channel table — its
+    /// high-water mark under churn (bounded by peak concurrency, not
+    /// cumulative registrations).
+    public var channelsSlotCount: Int { channels.slotCount }
 
     // User hook invoked from the loop thread after the waker fires.
     //
@@ -200,8 +233,22 @@ public final class PollEventLoop: @unchecked Sendable {
     }
 
     deinit {
-        if let w = waker { _ = Glibc.close(w.fd) }
+        // The stored `waker`'s own deinit closes its eventfd — Waker
+        // owns the fd (mio contract); closing it here as well would
+        // double-close once the kernel recycles the number onto an
+        // unrelated fd.
         pthread_spin_destroy(&jobLock)
+        // Defensive: a loop discarded without a completed run() may
+        // still hold live channels — free their raw read buffers (the
+        // normal path is `recoverOrphanedContinuations`, which also
+        // resumes pending continuations; none can exist without run()).
+        channels.forEachLive { _, state in
+            if let buf = state.pointee.readBuffer {
+                state.pointee.readBuffer = nil
+                buf.deallocate()
+            }
+        }
+        channels.reset()
     }
 
     // MARK: Event loop
@@ -317,11 +364,11 @@ public final class PollEventLoop: @unchecked Sendable {
         sweepTimeouts(now: ContinuousClock.now)
     }
 
-    /// Two-phase sweep. Phase 1 is a read-only scan that collects
-    /// expired, still-pending continuations; phase 2 (after the scan,
-    /// so the dictionary is not mutated during iteration) claims each
-    /// continuation (sets the slot to `nil`), clears its deadline, and
-    /// resumes it.
+    /// Two-phase sweep. Phase 1 is a read-only scan over the dense
+    /// slot array that collects expired, still-pending continuations;
+    /// phase 2 (after the scan, so no slot pointer is held while
+    /// slots could be vacated) claims each continuation (nils the
+    /// slot field), clears its deadline, and resumes it.
     ///
     /// Claiming is the only synchronisation needed vs readiness
     /// (`processChannelEvent`): both run on the loop thread, serialized,
@@ -329,32 +376,34 @@ public final class PollEventLoop: @unchecked Sendable {
     /// wins per continuation. `cont.resume()` schedules the Task on the
     /// loop; it does not re-enter this state synchronously.
     private func sweepTimeouts(now: ContinuousClock.Instant) {
-        // Phase 1: collect (read-only over `channels`).
-        var readTimedOut: [(UInt32, CheckedContinuation<Int, Never>)] = []
-        var writeTimedOut: [(UInt32, CheckedContinuation<Bool, Never>)] = []
-        for (id, state) in channels {
-            if let d = state.readDeadline, d <= now, state.pendingRead != nil,
-               let cont = state.pendingRead {
-                readTimedOut.append((id, cont))
+        // Phase 1: collect (read-only over the table).
+        var readTimedOut: [(slot: Int, cont: CheckedContinuation<Int, Never>)] = []
+        var writeTimedOut: [(slot: Int, cont: CheckedContinuation<Bool, Never>)] = []
+        channels.forEachLive { slot, state in
+            if let d = state.pointee.readDeadline, d <= now,
+               let cont = state.pointee.pendingRead {
+                readTimedOut.append((slot, cont))
             }
-            if let d = state.writeDeadline, d <= now, state.pendingWrite != nil,
-               let cont = state.pendingWrite {
-                writeTimedOut.append((id, cont))
+            if let d = state.pointee.writeDeadline, d <= now,
+               let cont = state.pointee.pendingWrite {
+                writeTimedOut.append((slot, cont))
             }
         }
         // Phase 2: claim + clear + resume (mutating, not iterating).
-        for (id, cont) in readTimedOut {
-            guard var state = channels[id], state.pendingRead != nil else { continue }
-            state.pendingRead = nil
-            state.readDeadline = nil
-            channels[id] = state
+        // No user code ran between the phases, so the slot cannot have
+        // been vacated or reallocated — a plain live check suffices.
+        for (slot, cont) in readTimedOut {
+            let state = channels.pointer(slot: slot)
+            guard state.pointee.pendingRead != nil else { continue }
+            state.pointee.pendingRead = nil
+            state.pointee.readDeadline = nil
             cont.resume(returning: -2)  // read-timeout sentinel
         }
-        for (id, cont) in writeTimedOut {
-            guard var state = channels[id], state.pendingWrite != nil else { continue }
-            state.pendingWrite = nil
-            state.writeDeadline = nil
-            channels[id] = state
+        for (slot, cont) in writeTimedOut {
+            let state = channels.pointer(slot: slot)
+            guard state.pointee.pendingWrite != nil else { continue }
+            state.pointee.pendingWrite = nil
+            state.pointee.writeDeadline = nil
             cont.resume(returning: false)  // write-timeout (≡ error → bail)
         }
     }
@@ -365,25 +414,62 @@ public final class PollEventLoop: @unchecked Sendable {
         _ = waker?.wake()
     }
 
+    // MARK: Loop-thread contract enforcement
+
+    /// Enforce the loop-thread contract at every state-mutating entry
+    /// point. Two legal regimes:
+    ///
+    ///   * **Setup** (`loopThreadId == 0`): the loop has not run yet —
+    ///     any single thread may set the table up (the conventional
+    ///     register-before-`run()` pattern).
+    ///   * **Running**: exactly the loop thread may touch the table.
+    ///
+    /// A violation is a programming error (cross-thread table mutation
+    /// races table growth → use-after-free), so it traps loudly —
+    /// SwiftNIO-style fail-fast — instead of corrupting state.
+    /// `precondition` survives in release builds; the check itself is
+    /// one acquire-load + compare, off the per-event path.
+    @inline(__always)
+    private func precondLoopThread(_ op: StaticString) {
+        let tid = loopThreadId.load(ordering: .acquiring)
+        if tid != 0 {
+            precondition(
+                UInt(pthread_self()) == tid,
+                "PollEventLoop: \(op) must run on the loop thread while the loop is running (or before run())"
+            )
+        }
+    }
+
     // MARK: Channel management
 
-    /// Allocate a fresh, unique channelId. Use the returned id with
-    /// `read`/`write`/`cancelChannel`. The id is never reused, which
-    /// prevents fd-recycling misattribution. Allocates a per-channel
-    /// read buffer (8KB, reused across keep-alive requests).
-    public func registerChannel() -> UInt32 {
-        let id = nextChannelId
-        nextChannelId &+= 1
+    /// Allocate a fresh channel handle. Use the returned id with
+    /// `read`/`write`/`cancelChannel`. The id encodes the slab slot
+    /// plus a generation counter, so it can never be confused with a
+    /// later channel that reuses the same slot (a stale handle traps
+    /// with a precondition instead of acting on the new occupant).
+    /// Allocates a per-channel read buffer (8KB, reused across
+    /// keep-alive requests).
+    ///
+    /// - Precondition: called before `run()` or on the loop thread —
+    ///   enforced by `precondLoopThread`.
+    public func registerChannel() -> ChannelId {
+        precondLoopThread("registerChannel")
         var state = PollChannelState(fd: -1)
         state.readBuffer = .allocate(capacity: state.readCapacity)
-        channels[id] = state
-        return id
+        let (slot, gen) = channels.alloc(state, isWatch: false)
+        return packChannelId(slot: slot, gen: gen)
     }
+
+    /// fd → slot for WATCH channels only (listeners — a handful per
+    /// loop; data channels never enter it). Loop-thread only, like the
+    /// slab. Turns `cancelWatch` from a table scan into an O(1) map
+    /// hit on a cold path.
+    private var watchByFd: [CInt: Int] = [:]
 
     /// Register a watch channel — an fd the caller wants to drive
     /// directly via `handler` rather than through the async read/write
-    /// API. Returns a fresh channelId that can later be passed to
-    /// `cancelChannel`.
+    /// API. Returns a fresh `ChannelId` that can later be passed to
+    /// `cancelChannel` (or use `cancelWatch(fd:)`).
     ///
     /// The canonical use case is a listening socket: register it with
     /// `.readable` (level-triggered, no `.oneshot`) and drain
@@ -394,27 +480,48 @@ public final class PollEventLoop: @unchecked Sendable {
     ///
     /// `handler` runs on the loop thread. It is stored (escaping) for the
     /// lifetime of the channel; allocate it once at setup, not per event.
+    ///
+    /// - Precondition: called before `run()` or on the loop thread —
+    ///   enforced by `precondLoopThread`.
     public func registerWatch(
         fd: CInt, interest: Interest,
         _ handler: @Sendable @escaping (Ready) -> Void
-    ) throws -> UInt32 {
-        let id = nextChannelId
-        nextChannelId &+= 1
+    ) throws -> ChannelId {
+        precondLoopThread("registerWatch")
         var state = PollChannelState(fd: fd)
         state.watch = handler
-        try registry.register(fd: fd, token: Token(id), interest: interest)
-        state.registered = true
-        channels[id] = state
-        return id
+        let (slot, gen) = channels.alloc(state, isWatch: true)
+        let handle = packChannelId(slot: slot, gen: gen)
+        do {
+            try registry.register(fd: fd, token: handle.asToken, interest: interest)
+        } catch {
+            // Roll the slot back: the caller sees the error and holds
+            // no handle, so a live slot (and its stored closure) would
+            // otherwise leak until shutdown. `remove` also bumps the
+            // generation, so the token that may have partially reached
+            // the kernel is already stale.
+            _ = channels.remove(slot: slot)
+            throw error
+        }
+        channels.pointer(slot: slot).pointee.registered = true
+        watchByFd[fd] = slot
+        return handle
     }
 
     /// Cancel any outstanding read/write on `channelId`. Pending
-    /// continuations are resumed with `-1`. Should be called on the
-    /// loop thread (typically from the connection-loop Task body).
-    /// Also valid for a watch channel: its handler closure is released
-    /// when the entry is removed.
-    public func cancelChannel(_ channelId: UInt32) {
-        guard let state = channels.removeValue(forKey: channelId) else { return }
+    /// continuations are resumed with `-1`. Also valid for a watch
+    /// channel: its handler closure is released when the entry is
+    /// removed. No-op for an already-cancelled id (the generation no
+    /// longer matches the slot).
+    ///
+    /// - Precondition: called before `run()` or on the loop thread —
+    ///   enforced by `precondLoopThread`.
+    public func cancelChannel(_ channelId: ChannelId) {
+        precondLoopThread("cancelChannel")
+        guard channels.isValid(slot: channelId.slot, gen: channelId.generation)
+        else { return }
+        let state = channels.remove(slot: channelId.slot)
+        if state.watch != nil { watchByFd.removeValue(forKey: state.fd) }
         if let cont = state.pendingRead  { cont.resume(returning: -1) }
         if let cont = state.pendingWrite { cont.resume(returning: false) }
         if state.registered { try? registry.deregister(fd: state.fd) }
@@ -422,24 +529,21 @@ public final class PollEventLoop: @unchecked Sendable {
         if let buf = state.readBuffer { buf.deallocate() }
     }
 
-    /// Cancel the watch channel registered for `fd` — find its
-    /// channelId (one fd maps to at most one channel: epoll registers
-    /// a fd once) and run `cancelChannel` on it, which deregisters the
-    /// fd from epoll and releases the stored watch closure. O(active
-    /// channels); intended for the shutdown path (e.g. stopping a
+    /// Cancel the watch channel registered for `fd` (one fd maps to at
+    /// most one channel: epoll registers a fd once). O(1) via the
+    /// `watchByFd` side map. Runs `cancelChannel` on the slot, which
+    /// deregisters the fd from epoll and releases the stored watch
+    /// closure. Intended for the shutdown path (e.g. stopping a
     /// level-triggered listener so it stops firing readability and
-    /// busy-looping). Must be called on the loop thread, like
-    /// `cancelChannel`. No-op if `fd` has no channel.
+    /// busy-looping). No-op if `fd` has no watch channel.
+    ///
+    /// - Precondition: called before `run()` or on the loop thread —
+    ///   enforced by `precondLoopThread`.
     public func cancelWatch(fd: CInt) {
-        // Read-only scan first; the mutation (`cancelChannel`) runs
-        // only after the iteration ends, so `channels` is never
-        // mutated during iteration.
-        var target: UInt32? = nil
-        for (id, state) in channels where state.fd == fd {
-            target = id
-            break
-        }
-        if let id = target { cancelChannel(id) }
+        precondLoopThread("cancelWatch")
+        guard let slot = watchByFd[fd] else { return }
+        let gen = channels.currentGeneration(slot: slot)
+        cancelChannel(packChannelId(slot: slot, gen: gen))
     }
 
     // MARK: Async read
@@ -458,7 +562,7 @@ public final class PollEventLoop: @unchecked Sendable {
     ///   the timeout (compat). Enforced by `sweepTimeouts` on each
     ///   timerfd tick, so granularity ≈ `timeoutSweepInterval`.
     public func read(
-        channelId: UInt32, fd: CInt,
+        channelId: ChannelId, fd: CInt,
         deadline: ContinuousClock.Instant? = nil
     ) async -> Int {
         return await withCheckedContinuation { cont in
@@ -468,28 +572,47 @@ public final class PollEventLoop: @unchecked Sendable {
 
     /// Get a view into the per-channel read buffer after `read()`
     /// returns. The pointer is valid until the next `read()` call
-    /// on the same channel. Called from the loop thread only.
-    public func getReadView(channelId: UInt32, count: Int) -> UnsafeBufferPointer<UInt8> {
-        guard let state = channels[channelId], let buf = state.readBuffer else {
+    /// on the same channel. Called from the loop thread only —
+    /// enforced by `precondLoopThread`.
+    public func getReadView(channelId: ChannelId, count: Int) -> UnsafeBufferPointer<UInt8> {
+        precondLoopThread("getReadView")
+        guard channels.isValid(slot: channelId.slot, gen: channelId.generation),
+              let buf = channels.pointer(slot: channelId.slot).pointee.readBuffer
+        else {
             return UnsafeBufferPointer(start: nil, count: 0)
         }
-        return UnsafeBufferPointer(start: buf, count: Swift.min(count, state.readCapacity))
+        return UnsafeBufferPointer(
+            start: buf,
+            count: Swift.min(count, channels.pointer(slot: channelId.slot).pointee.readCapacity)
+        )
     }
 
-    @inline(__always)
     private func armRead(
-        channelId: UInt32, fd: CInt,
+        channelId: ChannelId, fd: CInt,
         cont: CheckedContinuation<Int, Never>,
         deadline: ContinuousClock.Instant?
     ) {
-        var state = channels[channelId] ?? PollChannelState(fd: fd)
-        state.fd = fd
-        precondition(state.pendingRead == nil,
+        // Runs in the `read()` continuation body — i.e. on the awaiting
+        // Task's thread, which the contract requires to be the loop
+        // (or pre-run setup). Enforced here so a mispinned caller fails
+        // at the first state mutation, not as a cross-thread race.
+        precondLoopThread("read")
+        precondition(
+            channels.isValid(slot: channelId.slot, gen: channelId.generation),
+            "PollEventLoop.armRead: stale channel handle — use after cancelChannel"
+        )
+        let state = channels.pointer(slot: channelId.slot)
+        // A watch channel's events are dispatched to its handler and
+        // never reach the continuation path — arming a read there
+        // would hang the awaiting Task forever. Fail fast instead.
+        precondition(state.pointee.watch == nil,
+            "PollEventLoop: async read is unavailable on watch channels — the handler owns the I/O")
+        state.pointee.fd = fd
+        precondition(state.pointee.pendingRead == nil,
             "PollEventLoop: overlapping read on channelId=\(channelId)")
-        state.pendingRead = cont
-        state.readDeadline = deadline
-        rearm(channelId: channelId, state: &state)
-        channels[channelId] = state
+        state.pointee.pendingRead = cont
+        state.pointee.readDeadline = deadline
+        rearm(slot: channelId.slot, gen: channelId.generation, state: state)
     }
 
     // MARK: Async write
@@ -521,7 +644,7 @@ public final class PollEventLoop: @unchecked Sendable {
     /// - Precondition: no other write wait may be in flight on the
     ///   same `channelId`.
     public func write(
-        channelId: UInt32, fd: CInt,
+        channelId: ChannelId, fd: CInt,
         from buffer: UnsafeRawBufferPointer
     ) async -> Int {
         var offset = 0
@@ -553,7 +676,7 @@ public final class PollEventLoop: @unchecked Sendable {
     /// - Parameter deadline: absolute time after which an unanswered
     ///   readiness wait is failed with `false`. `nil` disables it.
     public func awaitWritable(
-        channelId: UInt32, fd: CInt,
+        channelId: ChannelId, fd: CInt,
         deadline: ContinuousClock.Instant? = nil
     ) async -> Bool {
         await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
@@ -561,21 +684,28 @@ public final class PollEventLoop: @unchecked Sendable {
         }
     }
 
-    @inline(__always)
     private func armWritable(
-        channelId: UInt32, fd: CInt,
+        channelId: ChannelId, fd: CInt,
         cont: CheckedContinuation<Bool, Never>,
         deadline: ContinuousClock.Instant?
     ) {
-        var state = channels[channelId] ?? PollChannelState(fd: fd)
-        state.fd = fd
-        precondition(state.pendingWrite == nil,
+        // See armRead: the awaiting Task must be loop-pinned.
+        precondLoopThread("awaitWritable/write")
+        precondition(
+            channels.isValid(slot: channelId.slot, gen: channelId.generation),
+            "PollEventLoop.armWritable: stale channel handle — use after cancelChannel"
+        )
+        let state = channels.pointer(slot: channelId.slot)
+        // Symmetric to armRead: a write-wait armed on a watch channel
+        // would never be resumed.
+        precondition(state.pointee.watch == nil,
+            "PollEventLoop: async write is unavailable on watch channels — the handler owns the I/O")
+        state.pointee.fd = fd
+        precondition(state.pointee.pendingWrite == nil,
             "PollEventLoop: overlapping write on channelId=\(channelId) — previous continuation would leak")
-        state.pendingWrite = cont
-        state.writeDeadline = deadline
-        rearm(channelId: channelId, state: &state)
-        // Single write-back after rearm (see armRead for rationale).
-        channels[channelId] = state
+        state.pointee.pendingWrite = cont
+        state.pointee.writeDeadline = deadline
+        rearm(slot: channelId.slot, gen: channelId.generation, state: state)
     }
 
     // MARK: Re-arm logic
@@ -583,18 +713,26 @@ public final class PollEventLoop: @unchecked Sendable {
     /// Recompute the interest mask for the channel based on currently
     /// pending ops, then ADD or MOD the fd. Called after each op is
     /// armed and after each event is processed.
-    @inline(__always)
-    private func rearm(channelId: UInt32, state: inout PollChannelState) {
+    ///
+    /// Mutates the state IN PLACE through the slot pointer — no local
+    /// copy, no write-back (the previous dictionary design paid a
+    /// copy-out and a write-back per call). The registration token
+    /// carries the handle `(slot, gen)` verbatim so delivered events
+    /// resolve back to this exact allocation.
+    private func rearm(
+        slot: Int, gen: UInt32,
+        state: UnsafeMutablePointer<PollChannelState>
+    ) {
         var interest: Interest = []
-        if state.pendingRead != nil  { interest.insert(.readable) }
-        if state.pendingWrite != nil { interest.insert(.writable) }
+        if state.pointee.pendingRead != nil  { interest.insert(.readable) }
+        if state.pointee.pendingWrite != nil { interest.insert(.writable) }
 
         // If nothing is pending, deregister to free the epoll slot —
         // otherwise the kernel keeps a dangling interest entry.
         guard !interest.isEmpty else {
-            if state.registered {
-                try? registry.deregister(fd: state.fd)
-                state.registered = false
+            if state.pointee.registered {
+                try? registry.deregister(fd: state.pointee.fd)
+                state.pointee.registered = false
             }
             return
         }
@@ -603,27 +741,29 @@ public final class PollEventLoop: @unchecked Sendable {
         // the loop decides what to do next.
         interest.insert(.oneshot)
 
+        let token = packChannelId(slot: slot, gen: gen).asToken
         do {
-            if state.registered {
+            if state.pointee.registered {
                 try registry.reregister(
-                    fd: state.fd, token: Token(channelId), interest: interest
+                    fd: state.pointee.fd, token: token, interest: interest
                 )
             } else {
                 try registry.register(
-                    fd: state.fd, token: Token(channelId), interest: interest
+                    fd: state.pointee.fd, token: token, interest: interest
                 )
-                state.registered = true
+                state.pointee.registered = true
             }
         } catch {
-            // EBADF / ENOMEM / ENOMEM: surface as immediate error to the
-            // caller(s) by resuming with -1. The channels dict stays
-            // consistent.
-            if let cont = state.pendingRead {
-                state.pendingRead = nil
+            // EBADF / ENOMEM: surface as immediate error to the
+            // caller(s) by resuming with -1. The table stays
+            // consistent — continuation fields are nilled in the slot
+            // BEFORE resume (a resumed Task re-enters via drainJobs).
+            if let cont = state.pointee.pendingRead {
+                state.pointee.pendingRead = nil
                 cont.resume(returning: -1)
             }
-            if let cont = state.pendingWrite {
-                state.pendingWrite = nil
+            if let cont = state.pointee.pendingWrite {
+                state.pointee.pendingWrite = nil
                 cont.resume(returning: false)
             }
         }
@@ -631,28 +771,49 @@ public final class PollEventLoop: @unchecked Sendable {
 
     // MARK: Channel-event processing
 
-    @inline(__always)
-    private func processChannelEvent(_ event: Event) {
-        let channelId = UInt32(truncatingIfNeeded: event.token.raw)
-        guard var state = channels[channelId] else { return }
+    /// The hot path: one call per delivered epoll event. Unpacks
+    /// `(slot, gen)` from the token, validates the generation (events
+    /// for cancelled channels — including events later in the SAME
+    /// batch than a `cancelChannel` issued from a watch handler —
+    /// fail here and are dropped), then mutates the state in place.
+    ///
+    /// The watch/data decision reads the parallel `watchFlags` byte
+    /// first: one static-offset load, no state-field access on the
+    /// data path (state field offsets are runtime-computed for the
+    /// non-frozen struct — the flag array avoids paying that per
+    /// event).
+    ///
+    /// Discipline: continuation fields are nilled in the slot before
+    /// `resume`; the slot pointer is not held across the `watch`
+    /// handler call (the handler may cancel this slot).
+    internal func processChannelEvent(_ event: Event) {
+        let raw = event.token.raw
+        let slot = Int(truncatingIfNeeded: raw & 0xFFFF_FFFF)
+        let gen = UInt32(truncatingIfNeeded: raw >> 32)
+        guard channels.isValid(slot: slot, gen: gen) else { return }
 
-        // Watch channels: the caller owns I/O. Invoke the handler and
-        // return without touching the read/write continuation path or
-        // re-arming — the fd stays armed with its caller-supplied
-        // interest (typically level-triggered + persistent). No write-
-        // back needed: `state` is unmodified here.
-        if let watch = state.watch {
+        // Watch channels: the caller owns I/O. Copy the closure to a
+        // local (the handler may cancel this slot, releasing the
+        // stored reference while we are inside the call), invoke it,
+        // and return without touching the slot again — no re-arming,
+        // the fd stays armed with its caller-supplied interest
+        // (typically level-triggered + persistent).
+        if channels.isWatch(slot: slot),
+           let watch = channels.pointer(slot: slot).pointee.watch {
             watch(event.ready)
             return
         }
 
-        let fd = state.fd
+        let state = channels.pointer(slot: slot)
+
+        let fd = state.pointee.fd
 
         // Read readiness: issue read(2) into internal buffer, resume waiter.
-        if event.isReadable, let cont = state.pendingRead {
-            state.pendingRead = nil
-            state.readDeadline = nil
-            let n = Glibc.read(fd, state.readBuffer!, state.readCapacity)
+        if event.isReadable, let cont = state.pointee.pendingRead {
+            state.pointee.pendingRead = nil
+            state.pointee.readDeadline = nil
+            let n = Glibc.read(
+                fd, state.pointee.readBuffer!, state.pointee.readCapacity)
             cont.resume(returning: Int(n))
         }
 
@@ -661,9 +822,9 @@ public final class PollEventLoop: @unchecked Sendable {
         // writability (`true`). No buffer is dereferenced on the loop
         // side — the write-side symmetric counterpart of the read path,
         // which differs only because the loop owns the read destination.
-        if event.isWritable, let cont = state.pendingWrite {
-            state.pendingWrite = nil
-            state.writeDeadline = nil
+        if event.isWritable, let cont = state.pointee.pendingWrite {
+            state.pointee.pendingWrite = nil
+            state.pointee.writeDeadline = nil
             cont.resume(returning: true)
         }
 
@@ -675,59 +836,75 @@ public final class PollEventLoop: @unchecked Sendable {
         // claim. EPOLLRDHUP (peer half-close) alone does NOT fail a
         // pending write: the local side may still flush.
         if event.ready.isError {
-            if let cont = state.pendingRead {
-                state.pendingRead = nil
-                state.readDeadline = nil
+            if let cont = state.pointee.pendingRead {
+                state.pointee.pendingRead = nil
+                state.pointee.readDeadline = nil
                 cont.resume(returning: -1)
             }
-            if let cont = state.pendingWrite {
-                state.pendingWrite = nil
-                state.writeDeadline = nil
+            if let cont = state.pointee.pendingWrite {
+                state.pointee.pendingWrite = nil
+                state.pointee.writeDeadline = nil
                 cont.resume(returning: false)
             }
         } else if event.ready.isHangup {
-            if let cont = state.pendingRead {
-                state.pendingRead = nil
-                state.readDeadline = nil
+            if let cont = state.pointee.pendingRead {
+                state.pointee.pendingRead = nil
+                state.pointee.readDeadline = nil
                 cont.resume(returning: 0)
             }
-            if let cont = state.pendingWrite {
-                state.pendingWrite = nil
-                state.writeDeadline = nil
+            if let cont = state.pointee.pendingWrite {
+                state.pointee.pendingWrite = nil
+                state.pointee.writeDeadline = nil
                 cont.resume(returning: false)
             }
         } else if event.ready.isReadClosed,
-                  let cont = state.pendingRead {
+                  let cont = state.pointee.pendingRead {
             // EPOLLRDHUP: peer closed write side — deliver read EOF.
-            state.pendingRead = nil
-            state.readDeadline = nil
+            state.pointee.pendingRead = nil
+            state.pointee.readDeadline = nil
             cont.resume(returning: 0)
         }
 
         // Re-arm with whatever is still pending. If both directions
-        // were satisfied, this deregisters. Single write-back after
-        // rearm (see armRead for rationale).
-        rearm(channelId: channelId, state: &state)
-        channels[channelId] = state
+        // were satisfied, this deregisters.
+        rearm(slot: slot, gen: gen, state: state)
     }
 
     // MARK: Orphan recovery
 
     private func recoverOrphanedContinuations() {
-        for (_, var state) in channels {
-            if let cont = state.pendingRead {
-                state.pendingRead = nil
+        channels.forEachLive { _, state in
+            if let cont = state.pointee.pendingRead {
+                state.pointee.pendingRead = nil
                 cont.resume(returning: -1)
             }
-            if let cont = state.pendingWrite {
-                state.pendingWrite = nil
+            if let cont = state.pointee.pendingWrite {
+                state.pointee.pendingWrite = nil
                 cont.resume(returning: false)
+            }
+            // Free per-channel read buffers here as well: the raw
+            // allocations are NOT released by state deinitialization
+            // (the previous dictionary design leaked them on this
+            // path — only `cancelChannel` freed them).
+            if let buf = state.pointee.readBuffer {
+                state.pointee.readBuffer = nil
+                buf.deallocate()
             }
         }
         // Releases any held watch closures (e.g. the listener's accept
         // handler) as well as the channel states.
-        channels.removeAll()
+        channels.reset()
+        watchByFd.removeAll()
         _ = overflowEvents.increment()
+    }
+
+    /// White-box probe for tests (`@testable`): whether a read
+    /// continuation is currently armed on the channel. Not part of
+    /// the public contract.
+    internal func _readPending(_ channelId: ChannelId) -> Bool {
+        guard channels.isValid(slot: channelId.slot, gen: channelId.generation)
+        else { return false }
+        return channels.pointer(slot: channelId.slot).pointee.pendingRead != nil
     }
 
     // MARK: Job queue (SerialExecutor)
