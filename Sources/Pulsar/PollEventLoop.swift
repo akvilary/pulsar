@@ -50,6 +50,33 @@ import Synchronization
 import Glibc
 #endif
 
+// MARK: - Cancellable-call machinery
+
+/// Per-call state for a cancellable wait: the cancellation flag (set by
+/// `onCancel` on the cancelling thread, read by the loop when applying
+/// the ordered requests) doubles as the call's IDENTITY — the channel
+/// slot stores it next to the continuation so a cancel can only ever
+/// claim ITS OWN wait (see `disarmOp`).
+fileprivate final class CallState: @unchecked Sendable {
+    let cancelled = Atomic<Bool>(false)
+}
+
+/// A cross-thread request applied by the loop in strict append order
+/// (see `PollEventLoop.loopRequests`). Arms come from the global-pool
+/// frames of cancellable `read`/`awaitWritable` calls; cancels come
+/// from `onCancel` on the cancelling thread. The single-box lock gives
+/// the happens-before edge that makes `CallState.cancelled` visible to
+/// any arm request appended after the cancel.
+fileprivate enum LoopRequest: Sendable {
+    case armRead(
+        ChannelId, deadline: ContinuousClock.Instant?,
+        CallState, CheckedContinuation<Int, Never>)
+    case armWrite(
+        ChannelId, deadline: ContinuousClock.Instant?,
+        CallState, CheckedContinuation<Bool, Never>)
+    case cancel(ChannelId, isRead: Bool, CallState)
+}
+
 // MARK: - ChannelState
 
 /// Per-channel pending-op state. Held by the loop, mutated only on the
@@ -92,6 +119,10 @@ internal struct PollChannelState {
     var origFd: CInt = -1
     var registered: Bool = false
     var pendingRead: CheckedContinuation<Int, Never>?
+    /// Identity of the cancellable call that armed `pendingRead`
+    /// (nil for plain arms). Cancels claim their continuation by
+    /// identity — see `disarmOp`.
+    fileprivate var pendingReadCall: CallState?
     /// Absolute deadline after which a pending read is considered timed
     /// out. Set together with `pendingRead`; cleared together with it.
     /// Enforced by `sweepTimeouts` on each timerfd tick.
@@ -103,6 +134,8 @@ internal struct PollChannelState {
     /// awaits. This mirrors tokio/mio: the reactor provides only
     /// readiness (`EPOLLOUT`), the I/O type does the syscall.
     var pendingWrite: CheckedContinuation<Bool, Never>?
+    /// Identity of the cancellable call that armed `pendingWrite`.
+    fileprivate var pendingWriteCall: CallState?
     /// Absolute deadline after which a pending write-wait is considered
     /// timed out. Set together with `pendingWrite`; cleared together.
     var writeDeadline: ContinuousClock.Instant?
@@ -275,6 +308,23 @@ public final class PollEventLoop: @unchecked Sendable {
     /// cumulative registrations). Relaxed snapshot, any thread.
     public var channelsSlotCount: Int { channels.slotCountApprox }
 
+    // Loop-request queue (Task cancellation propagation).
+    //
+    // `withTaskCancellationHandler`'s operation runs on the GLOBAL
+    // concurrent executor (verified empirically on Swift 6.2: the
+    // stdlib wrapper does not inherit the caller's executor), so a
+    // cancellable wait may NOT arm channel state from its own frame.
+    // Instead, both arming and cancellation are expressed as requests
+    // appended to ONE ordered box and applied by the loop on ITS
+    // thread in strict append order (single LockedBox ⇒ append order
+    // == application order, and its lock supplies the happens-before
+    // edge that makes the per-call `CallState.cancelled` flag visible
+    // to a later arm request — see `handleWakeup`'s drain).
+    //
+    // This is the canonical tokio `ScheduledIo` shape: per-call
+    // registration, ordered application, claim by identity.
+    private let loopRequests = LockedBox<[LoopRequest]>([])
+
     // User hook invoked from the loop thread after the waker fires.
     //
     // Backed by a `LockedBox` so a `set` from any thread cannot race
@@ -347,6 +397,7 @@ public final class PollEventLoop: @unchecked Sendable {
             }
         }
         channels.reset()
+        drainPendingLoopRequests()
         // Backstop: run()'s tail normally closes the timer and stores
         // -1; this only fires for future code paths that skip it.
         // Capture the value BEFORE clearing the field.
@@ -469,6 +520,7 @@ public final class PollEventLoop: @unchecked Sendable {
         // fds, codecs, etc.) would leak — their cleanup code (which
         // calls closeConnection and returns) never runs.
         recoverOrphanedContinuations()
+        drainPendingLoopRequests()
         drainJobs()
 
         if timerFd >= 0 {
@@ -526,11 +578,108 @@ public final class PollEventLoop: @unchecked Sendable {
             _ = TimerFd.setPeriodic(
                 fd: timerFd, interval: timeoutSweepInterval)
         }
+        // Apply loop requests (arming + cancellation) in strict append
+        // order — internal housekeeping before the user hook.
+        var requests: [LoopRequest] = []
+        loopRequests.withLock {
+            swap(&requests, &$0)
+        }
+        for request in requests {
+            switch request {
+            case let .armRead(channelId, deadline, call, cont):
+                applyArm(
+                    channelId: channelId, deadline: deadline,
+                    call: call, cont: cont)
+            case let .armWrite(channelId, deadline, call, cont):
+                applyArm(
+                    channelId: channelId, deadline: deadline,
+                    call: call, cont: cont)
+            case let .cancel(channelId, isRead, call):
+                disarmOp(channelId, isRead: isRead, call: call)
+            }
+        }
         // Read the callback under the lock, invoke it OUTSIDE so a
         // re-entrant callback (e.g., one that enqueues on the loop)
         // cannot take the same lock recursively.
         let cb = onWakeupBox.withLock { $0 }
         cb?()
+    }
+
+    /// Apply a boxed arm request (loop thread). Refuses to arm — and
+    /// fails the wait immediately — when the call was cancelled before
+    /// the request got here: the single-box lock chain guarantees the
+    /// `cancelled` flag is visible whenever the cancel request was
+    /// appended BEFORE this arm request. Otherwise this is exactly
+    /// `armRead`/`armWritable` (all of their fast-fail paths included).
+    private func applyArm(
+        channelId: ChannelId,
+        deadline: ContinuousClock.Instant?,
+        call: CallState,
+        cont: CheckedContinuation<Int, Never>
+    ) {
+        if call.cancelled.load(ordering: .acquiring) {
+            cont.resume(returning: -1)
+            return
+        }
+        armRead(channelId: channelId, cont: cont, deadline: deadline, call: call)
+    }
+
+    private func applyArm(
+        channelId: ChannelId,
+        deadline: ContinuousClock.Instant?,
+        call: CallState,
+        cont: CheckedContinuation<Bool, Never>
+    ) {
+        if call.cancelled.load(ordering: .acquiring) {
+            cont.resume(returning: false)
+            return
+        }
+        armWritable(channelId: channelId, cont: cont, deadline: deadline, call: call)
+    }
+
+    /// Fail one pending op wait as cancelled (`-1` / `false`) WITHOUT
+    /// tearing the channel down — cancelling a wait is not cancelling a
+    /// channel; the caller may re-arm or `cancelChannel` afterwards.
+    ///
+    /// Identity-checked: the slot's continuation is resumed only if it
+    /// belongs to THIS call (`pendingReadCall === call`). A cancel that
+    /// races another call's arm on the same channel — or arrives after
+    /// its own call already completed and the slot was re-armed by a
+    /// different call — is a harmless no-op. Without this identity
+    /// check, a stale or box-phase cancel could kill an unrelated
+    /// waiter on the same channel.
+    ///
+    /// Claim discipline (one of the claim sites, alongside the event,
+    /// timeout, cancelChannel, rearm-error and orphan-recovery paths):
+    /// whoever nils the slot field first owns the resume. The kernel
+    /// interest is recomputed BEFORE resuming — the resumed Task may
+    /// synchronously re-enter and re-arm.
+    ///
+    /// Loop thread only (driven from `handleWakeup`).
+    private func disarmOp(_ channelId: ChannelId, isRead: Bool, call: CallState) {
+        precondLoopThread("disarmOp")
+        guard channels.isValid(slot: channelId.slot, gen: channelId.generation)
+        else { return }
+        let state = channels.pointer(slot: channelId.slot)
+        if isRead {
+            guard let cont = state.pointee.pendingRead,
+                  state.pointee.pendingReadCall === call
+            else { return }
+            state.pointee.pendingRead = nil
+            state.pointee.pendingReadCall = nil
+            state.pointee.readDeadline = nil
+            rearm(slot: channelId.slot, gen: channelId.generation, state: state)
+            cont.resume(returning: -1)
+        } else {
+            guard let cont = state.pointee.pendingWrite,
+                  state.pointee.pendingWriteCall === call
+            else { return }
+            state.pointee.pendingWrite = nil
+            state.pointee.pendingWriteCall = nil
+            state.pointee.writeDeadline = nil
+            rearm(slot: channelId.slot, gen: channelId.generation, state: state)
+            cont.resume(returning: false)
+        }
     }
 
     // MARK: Timeout sweep
@@ -582,6 +731,7 @@ public final class PollEventLoop: @unchecked Sendable {
             let state = channels.pointer(slot: slot)
             guard state.pointee.pendingRead != nil else { continue }
             state.pointee.pendingRead = nil
+            state.pointee.pendingReadCall = nil
             state.pointee.readDeadline = nil
             cont.resume(returning: -2)  // read-timeout sentinel
         }
@@ -589,6 +739,7 @@ public final class PollEventLoop: @unchecked Sendable {
             let state = channels.pointer(slot: slot)
             guard state.pointee.pendingWrite != nil else { continue }
             state.pointee.pendingWrite = nil
+            state.pointee.pendingWriteCall = nil
             state.pointee.writeDeadline = nil
             cont.resume(returning: false)  // write-timeout (≡ error → bail)
         }
@@ -822,16 +973,51 @@ public final class PollEventLoop: @unchecked Sendable {
     /// eliminates the need for the caller to own a raw buffer (and
     /// thus the need for @unchecked Sendable on decoder/conn types).
     ///
+    /// **Cancellation** (cooperative): a Task cancelled BEFORE the call
+    /// fails fast with `-1` on every path. Full cancellation — a Task
+    /// cancelled WHILE suspended — requires `cancellable: true`: the
+    /// wait is then failed with `-1` promptly (best-effort, like tokio:
+    /// a readiness racing the cancellation may still deliver data) and
+    /// the channel stays usable. The opt-in exists because Swift's
+    /// cancellation handler runs its operation off the caller's
+    /// executor, so cancellable waits must round-trip through the
+    /// loop's request queue — a cost the hot path does not pay.
+    ///
     /// - Parameter deadline: absolute time after which an unanswered
     ///   readiness wait is failed with `-2` (timeout). `nil` disables
     ///   the timeout (compat). Enforced by `sweepTimeouts` on each
     ///   timerfd tick, so granularity ≈ `timeoutSweepInterval`.
     public func read(
         channelId: ChannelId,
-        deadline: ContinuousClock.Instant? = nil
+        deadline: ContinuousClock.Instant? = nil,
+        cancellable: Bool = false
     ) async -> Int {
-        return await withCheckedContinuation { cont in
-            armRead(channelId: channelId, cont: cont, deadline: deadline)
+        // Cheap hygiene on every path: a task already cancelled must
+        // not arm a wait at all.
+        if Task.isCancelled { return -1 }
+        if !cancellable {
+            // Hot path: the arm happens synchronously in THIS frame —
+            // which runs on the caller's executor (the loop for
+            // loop-pinned Tasks) — zero cross-thread machinery.
+            return await withCheckedContinuation { cont in
+                armRead(channelId: channelId, cont: cont, deadline: deadline)
+            }
+        }
+        // Cancellable path: `withTaskCancellationHandler`'s operation
+        // runs on the GLOBAL pool (the stdlib wrapper does not inherit
+        // the caller's executor), so channel state may not be touched
+        // here — the arm is expressed as a request the loop applies in
+        // ordered fashion (see `loopRequests`).
+        let call = CallState()
+        return await withTaskCancellationHandler {
+            if Task.isCancelled { return -1 }
+            return await withCheckedContinuation { cont in
+                self.submitRequest(
+                    .armRead(channelId, deadline: deadline, call, cont))
+            }
+        } onCancel: {
+            call.cancelled.store(true, ordering: .releasing)
+            self.submitRequest(.cancel(channelId, isRead: true, call))
         }
     }
 
@@ -855,7 +1041,8 @@ public final class PollEventLoop: @unchecked Sendable {
     private func armRead(
         channelId: ChannelId,
         cont: CheckedContinuation<Int, Never>,
-        deadline: ContinuousClock.Instant?
+        deadline: ContinuousClock.Instant?,
+        call: CallState? = nil
     ) {
         // Runs in the `read()` continuation body — i.e. on the awaiting
         // Task's thread, which the contract requires to be the loop
@@ -886,6 +1073,7 @@ public final class PollEventLoop: @unchecked Sendable {
         precondition(state.pointee.pendingRead == nil,
             "PollEventLoop: overlapping read on channelId=\(channelId)")
         state.pointee.pendingRead = cont
+        state.pointee.pendingReadCall = call
         state.pointee.readDeadline = deadline
         rearm(slot: channelId.slot, gen: channelId.generation, state: state)
     }
@@ -926,7 +1114,8 @@ public final class PollEventLoop: @unchecked Sendable {
     ///   `precondLoopThread`.
     public func write(
         channelId: ChannelId,
-        from buffer: UnsafeRawBufferPointer
+        from buffer: UnsafeRawBufferPointer,
+        cancellable: Bool = false
     ) async -> Int {
         precondLoopThread("write")
         var offset = 0
@@ -942,8 +1131,10 @@ public final class PollEventLoop: @unchecked Sendable {
             if n == 0 { break }          // socket: shouldn't happen
             if errno == EINTR { continue }
             if errno == EAGAIN || errno == EWOULDBLOCK {
-                if !(await awaitWritable(channelId: channelId)) {
-                    break                 // error / hangup
+                if !(await awaitWritable(
+                    channelId: channelId, cancellable: cancellable)
+                ) {
+                    break                 // error / hangup / cancellation
                 }
                 continue
             }
@@ -958,21 +1149,65 @@ public final class PollEventLoop: @unchecked Sendable {
     ///
     /// The caller issues the actual `write(2)` after this returns.
     ///
+    /// **Cancellation**: a Task cancelled while suspended (or before
+    /// the wait arms) fails fast with `false`; best-effort — a racing
+    /// writability may still win. The channel stays usable. `write`
+    /// inherits this at its await points.
+    ///
     /// - Parameter deadline: absolute time after which an unanswered
     ///   readiness wait is failed with `false`. `nil` disables it.
     public func awaitWritable(
         channelId: ChannelId,
-        deadline: ContinuousClock.Instant? = nil
+        deadline: ContinuousClock.Instant? = nil,
+        cancellable: Bool = false
     ) async -> Bool {
-        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-            armWritable(channelId: channelId, cont: cont, deadline: deadline)
+        if Task.isCancelled { return false }
+        if !cancellable {
+            return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                armWritable(channelId: channelId, cont: cont, deadline: deadline)
+            }
         }
+        let call = CallState()
+        return await withTaskCancellationHandler {
+            if Task.isCancelled { return false }
+            return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                self.submitRequest(
+                    .armWrite(channelId, deadline: deadline, call, cont))
+            }
+        } onCancel: {
+            call.cancelled.store(true, ordering: .releasing)
+            self.submitRequest(.cancel(channelId, isRead: false, call))
+        }
+    }
+
+    /// Append a loop request and wake the loop. Callable from ANY
+    /// thread (the cancellable paths use it from the global pool and
+    /// from the cancelling thread). If the loop has already exited,
+    /// un-appliable ARM requests are failed immediately instead of
+    /// parking their continuation in a box nobody drains (the residual
+    /// nano-window against a concurrent exit is the documented
+    /// post-terminal contract — see `droppedJobs`).
+    private func submitRequest(_ request: LoopRequest) {
+        if runExited.load(ordering: .acquiring) {
+            switch request {
+            case let .armRead(_, _, _, cont):
+                cont.resume(returning: -1)
+            case let .armWrite(_, _, _, cont):
+                cont.resume(returning: false)
+            case .cancel:
+                break
+            }
+            return
+        }
+        loopRequests.withLock { $0.append(request) }
+        waker.wake()
     }
 
     private func armWritable(
         channelId: ChannelId,
         cont: CheckedContinuation<Bool, Never>,
-        deadline: ContinuousClock.Instant?
+        deadline: ContinuousClock.Instant?,
+        call: CallState? = nil
     ) {
         // See armRead: the awaiting Task must be loop-pinned, and a
         // terminal shutdown fails the wait gracefully (false) rather
@@ -996,6 +1231,7 @@ public final class PollEventLoop: @unchecked Sendable {
         precondition(state.pointee.pendingWrite == nil,
             "PollEventLoop: overlapping write on channelId=\(channelId) — previous continuation would leak")
         state.pointee.pendingWrite = cont
+        state.pointee.pendingWriteCall = call
         state.pointee.writeDeadline = deadline
         rearm(slot: channelId.slot, gen: channelId.generation, state: state)
     }
@@ -1088,11 +1324,13 @@ public final class PollEventLoop: @unchecked Sendable {
             // BEFORE resume (a resumed Task re-enters via drainJobs).
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
+                state.pointee.pendingReadCall = nil
                 state.pointee.readDeadline = nil
                 cont.resume(returning: -1)
             }
             if let cont = state.pointee.pendingWrite {
                 state.pointee.pendingWrite = nil
+                state.pointee.pendingWriteCall = nil
                 state.pointee.writeDeadline = nil
                 cont.resume(returning: false)
             }
@@ -1145,6 +1383,7 @@ public final class PollEventLoop: @unchecked Sendable {
         // return value).
         if event.isReadable, let cont = state.pointee.pendingRead {
             state.pointee.pendingRead = nil
+            state.pointee.pendingReadCall = nil
             state.pointee.readDeadline = nil
             var n: Int = -1
             while true {
@@ -1162,6 +1401,7 @@ public final class PollEventLoop: @unchecked Sendable {
         // which differs only because the loop owns the read destination.
         if event.isWritable, let cont = state.pointee.pendingWrite {
             state.pointee.pendingWrite = nil
+            state.pointee.pendingWriteCall = nil
             state.pointee.writeDeadline = nil
             cont.resume(returning: true)
         }
@@ -1176,22 +1416,26 @@ public final class PollEventLoop: @unchecked Sendable {
         if event.ready.isError {
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
+                state.pointee.pendingReadCall = nil
                 state.pointee.readDeadline = nil
                 cont.resume(returning: -1)
             }
             if let cont = state.pointee.pendingWrite {
                 state.pointee.pendingWrite = nil
+                state.pointee.pendingWriteCall = nil
                 state.pointee.writeDeadline = nil
                 cont.resume(returning: false)
             }
         } else if event.ready.isHangup {
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
+                state.pointee.pendingReadCall = nil
                 state.pointee.readDeadline = nil
                 cont.resume(returning: 0)
             }
             if let cont = state.pointee.pendingWrite {
                 state.pointee.pendingWrite = nil
+                state.pointee.pendingWriteCall = nil
                 state.pointee.writeDeadline = nil
                 cont.resume(returning: false)
             }
@@ -1199,6 +1443,7 @@ public final class PollEventLoop: @unchecked Sendable {
                   let cont = state.pointee.pendingRead {
             // EPOLLRDHUP: peer closed write side — deliver read EOF.
             state.pointee.pendingRead = nil
+            state.pointee.pendingReadCall = nil
             state.pointee.readDeadline = nil
             cont.resume(returning: 0)
         }
@@ -1213,6 +1458,28 @@ public final class PollEventLoop: @unchecked Sendable {
             deregisterIfIdle: event.ready.isError || event.ready.isHangup
                 || event.ready.contains(.readHangup)
         )
+    }
+
+    /// Fail every still-boxed ARM request (`-1` / `false`). Cancels are
+    /// plain no-ops (nothing left to disarm). Runs on the loop thread
+    /// from run()'s tail and from deinit — a continuation left in the
+    /// box past teardown would strand its Task and, on object death,
+    /// trap the runtime as a leaked continuation.
+    private func drainPendingLoopRequests() {
+        var requests: [LoopRequest] = []
+        loopRequests.withLock {
+            swap(&requests, &$0)
+        }
+        for request in requests {
+            switch request {
+            case let .armRead(_, _, _, cont):
+                cont.resume(returning: -1)
+            case let .armWrite(_, _, _, cont):
+                cont.resume(returning: false)
+            case .cancel:
+                break
+            }
+        }
     }
 
     // MARK: Orphan recovery
@@ -1230,10 +1497,12 @@ public final class PollEventLoop: @unchecked Sendable {
             _ = Glibc.close(state.pointee.fd)
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
+                state.pointee.pendingReadCall = nil
                 cont.resume(returning: -1)
             }
             if let cont = state.pointee.pendingWrite {
                 state.pointee.pendingWrite = nil
+                state.pointee.pendingWriteCall = nil
                 cont.resume(returning: false)
             }
             // Free per-channel read buffers here as well: the raw

@@ -106,7 +106,6 @@ func phaseEcho(connections: Int, seconds: Double) async {
     // Readers: one loop-pinned Task per connection.
     var tasks: [Task<Void, Never>] = []
     for i in 0..<K {
-        let fd = pairs[i].1
         let id = ids[i]
         tasks.append(Task(executorPreference: loop) { [loop] in
             while true {

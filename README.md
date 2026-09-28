@@ -32,7 +32,7 @@ Linux only at the syscall level (`epoll`, `eventfd`, `timerfd`). All sources are
 ## Installation
 
 ```swift
-.package(url: "https://github.com/akvilary/pulsar.git", from: "0.3.0")
+.package(url: "https://github.com/akvilary/pulsar.git", from: "0.3.1")
 ```
 
 ```swift
@@ -128,6 +128,30 @@ first arm with a clean `-1` instead of hanging.
 Per-channel read buffers are pre-allocated (sized via
 `registerChannel(fd:readCapacity:)`, default 8 KiB) and reused across
 keep-alive requests, so allocation per request goes to zero after warmup.
+
+### Task cancellation (opt-in)
+
+A Task cancelled **before** calling `read`/`awaitWritable`/`write` fails
+fast (`-1` / `false`) on every path. Cancelling a Task **while it is
+suspended** requires `cancellable: true`:
+
+```swift
+// Inside a handler Task that a timeout layer may cancel:
+let n = await loop.read(channelId: id, cancellable: true)   // → -1 on cancel
+```
+
+The wait fails promptly with `-1` / `false` (best-effort, like tokio: a
+readiness racing the cancellation may still deliver data), the channel
+stays usable, and a cancel can only ever claim **its own** wait —
+cancels are matched by per-call identity, so concurrent calls on other
+channels (or later calls on the same one) are untouched.
+
+The opt-in flag exists because Swift's cancellation handler runs its
+operation on the global executor, not the caller's: cancellable waits
+must round-trip through the loop's ordered request queue (one extra
+eventfd wake per call) — a cost the default hot path does not pay.
+Concurrent reads (or writes) on a single channel remain a contract
+violation regardless of the flag.
 
 ### Bounded waits (Slowloris / write-stall defence)
 

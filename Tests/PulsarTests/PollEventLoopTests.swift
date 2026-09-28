@@ -695,6 +695,156 @@ struct PollEventLoopTests {
         _ = await cancelTask.value
     }
 
+    // MARK: - Task cancellation propagation (opt-in `cancellable: true`)
+
+    @Test("Cancelled cancellable read fails promptly instead of hanging")
+    func cancelledCancellableReadFailsPromptly() async throws {
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        let channelId = try loop.registerChannel(fd: b)
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        try await Task.sleep(for: .milliseconds(30))
+
+        // No data, NO deadline: without cancellation support this read
+        // would hang forever. Cancelled mid-wait it must return -1.
+        let task = Task(executorPreference: loop) { () -> Int in
+            await loop.read(channelId: channelId, cancellable: true)
+        }
+        try await Task.sleep(for: .milliseconds(50))   // let it arm
+        task.cancel()
+
+        let n = await task.value
+        #expect(n == -1, "cancelled read must fail with -1, got \(n)")
+
+        // Cancelling a wait must NOT tear the channel: a fresh read
+        // delivers subsequently-arriving data.
+        _ = Glibc.write(a, [0x7F as UInt8], 1)
+        let pinned = LoopPinned(loop.cachedExecutor)
+        let (n2, out) = await pinned.runRead(
+            loop: loop, channelId: channelId, capacity: 8)
+        #expect(n2 == 1, "channel must remain usable after wait cancellation")
+        #expect(out.first == 0x7F)
+    }
+
+    @Test("Task cancelled before its read runs fails fast (pre-arm)")
+    func cancelledBeforeArmFailsFast() async throws {
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        let channelId = try loop.registerChannel(fd: b)
+        // Spawn BEFORE the loop runs: the job sits in the pool queue,
+        // then cancel it, then start the loop — the read() body first
+        // observes Task.isCancelled and never arms.
+        let task = Task(executorPreference: loop) {
+            await loop.read(channelId: channelId, deadline: nil,
+                            cancellable: true)
+        }
+        task.cancel()
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+
+        let n = await task.value
+        #expect(n == -1, "pre-armed cancel must fast-fail with -1, got \(n)")
+    }
+
+    @Test("Cancel landing while the arm request is still in the queue (box order)")
+    func cancelBeatsBoxedArmRequest() async throws {
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        let channelId = try loop.registerChannel(fd: b)
+        // A NON-loop-pinned task (pre-run setup regime): its cancellable
+        // read runs on the global pool and parks the ARM REQUEST in the
+        // loop's queue while the loop is not yet running — the exact
+        // interleaving where a naive implementation would arm first and
+        // hang. Cancel lands after the arm request; the single-box
+        // happens-before chain must make the refusal see the flag.
+        let task = Task {
+            await loop.read(channelId: channelId, cancellable: true)
+        }
+        try await Task.sleep(for: .milliseconds(50))   // arm request parked
+        task.cancel()
+        try await Task.sleep(for: .milliseconds(30))   // cancel request parked
+
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+
+        let n = await task.value
+        #expect(n == -1, "boxed arm must be refused after cancel, got \(n)")
+    }
+
+    @Test("Cancelled cancellable awaitWritable fails promptly")
+    func cancelledCancellableAwaitWritableFails() async throws {
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        // Fill a's send buffer so awaitWritable genuinely waits.
+        let channelId = try loop.registerChannel(fd: a)
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        try await Task.sleep(for: .milliseconds(30))
+        let filler = [UInt8](repeating: 0x41, count: 65_536)
+        while filler.withUnsafeBufferPointer({ Glibc.write(a, $0.baseAddress!, $0.count) }) > 0 {}
+
+        let task = Task(executorPreference: loop) { () -> Bool in
+            await loop.awaitWritable(channelId: channelId, cancellable: true)
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        task.cancel()
+
+        let ok = await task.value
+        #expect(ok == false, "cancelled write-wait must fail with false")
+    }
+
+    @Test("Non-cancellable read on a cancelled task also fails fast")
+    func nonCancellableReadFastFailsWhenCancelled() async throws {
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        let channelId = try loop.registerChannel(fd: b)
+        let task = Task(executorPreference: loop) {
+            await loop.read(channelId: channelId)
+        }
+        task.cancel()
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+
+        let n = await task.value
+        #expect(n == -1, "cancelled task's plain read must fast-fail, got \(n)")
+    }
+
     @Test("cancelWatch resolves via the fd map and is idempotent")
     func cancelWatchUsesFdMap() async throws {
         let loop = try PollEventLoop()
