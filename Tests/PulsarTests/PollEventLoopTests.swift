@@ -262,6 +262,24 @@ struct PollEventLoopTests {
         // does not hang and does not crash.
     }
 
+    @Test("Task enqueued before run() runs once the loop starts (lost-wakeup regression)")
+    func taskEnqueuedBeforeRunCompletes() async throws {
+        let loop = try PollEventLoop()
+        // Enqueue BEFORE the loop thread exists: the initial job lands
+        // in the cross-thread queue while loopThreadId == 0, so no
+        // eventfd wake is issued (an enqueuer only wakes a RUNNING
+        // loop). Without run()'s initial drainJobs, the loop would
+        // block in its very first epoll_wait forever — this test
+        // would hang.
+        let task = Task(executorPreference: loop) { 42 }
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        defer { loop.shutdown() }
+
+        let value = await task.value
+        #expect(value == 42)
+    }
+
     // MARK: - Readiness timeouts (timerfd sweep)
 
     @Test("read with a deadline returns -2 when no data arrives")
@@ -327,6 +345,42 @@ struct PollEventLoopTests {
             loop: loop, channelId: channelId, fd: a, deadline: deadline)
 
         #expect(ok == false, "timed-out write-wait must return false")
+    }
+
+    @Test("timeoutSweepInterval retunes a RUNNING loop (timerfd re-arm)")
+    func sweepIntervalRetunesLiveLoop() async throws {
+        let loop = try PollEventLoop()          // default sweep: 500 ms
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        let channelId = loop.registerChannel()
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        try await Task.sleep(for: .milliseconds(30))
+
+        // Deadline 100 ms out. With the default 500 ms sweep this would
+        // be enforced no earlier than ~500 ms; retuning the interval to
+        // 50 ms mid-run must re-arm the timerfd (setter → flag → wake →
+        // handleWakeup re-arms) and enforce it by ~200 ms. The elapsed
+        // bound distinguishes the retuned path from the default cadence.
+        let deadline = ContinuousClock.now + .milliseconds(100)
+        let start = ContinuousClock.now
+        let task = Task(executorPreference: loop) {
+            await loop.read(channelId: channelId, fd: b, deadline: deadline)
+        }
+        try await Task.sleep(for: .milliseconds(50))   // let the read arm
+        loop.timeoutSweepInterval = .milliseconds(50)  // runtime retune
+
+        let n = await task.value
+        let elapsed = ContinuousClock.now - start
+        #expect(n == -2, "deadline must fire, got \(n)")
+        #expect(elapsed < .milliseconds(450),
+                "retuned sweep must enforce the deadline early, took \(elapsed)")
     }
 
     // MARK: - ChannelId / slab semantics
@@ -493,6 +547,67 @@ struct PollEventLoopTests {
         // instead of leaking it.
         let n = await readTask.value
         #expect(n == -1, "orphaned read must be failed with -1, got \(n)")
+    }
+
+    @Test("In-flight Task unwinds gracefully: post-shutdown read/awaitWritable fail, not trap")
+    func shutdownGracefulForInFlightTasks() async throws {
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer { _ = Glibc.close(a); _ = Glibc.close(b) }
+
+        let channelId = loop.registerChannel()
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        try await Task.sleep(for: .milliseconds(30))
+
+        // No data is ever written: the first read arms, then hangs
+        // until shutdown recovers it with -1. The SECOND read and the
+        // awaitWritable execute AFTER the tail has reset the channel
+        // table — their handles are stale by then. The old code trapped
+        // (precondition failure, process death) in exactly this path;
+        // the contract now fails the wait gracefully instead.
+        let task = Task(executorPreference: loop) { () -> (Int, Int, Bool) in
+            let r1 = await loop.read(channelId: channelId, fd: b)
+            let r2 = await loop.read(channelId: channelId, fd: b)
+            let w = await loop.awaitWritable(channelId: channelId, fd: b)
+            return (r1, r2, w)
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        loop.shutdown()
+
+        let result = await task.value
+        #expect(result == (-1, -1, false),
+                "post-shutdown waits must fail gracefully, got \(result)")
+    }
+
+    @Test("shutdown() is terminal: a second run() returns immediately")
+    func shutdownIsTerminal() async throws {
+        let loop = try PollEventLoop()
+        let firstDone = Atomic<Bool>(false)
+        let t1 = Thread { [loop] in
+            try? loop.run()
+            firstDone.store(true, ordering: .releasing)
+        }
+        t1.start()
+        try await Task.sleep(for: .milliseconds(50))
+        loop.shutdown()
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(firstDone.load(ordering: .acquiring) == true, "first run() must exit after shutdown()")
+
+        // A second run() must neither hang, nor trap (the waker is
+        // created in init and reused, not re-registered), nor
+        // resurrect the loop: shutdown is final, tokio/NIO-style.
+        let secondDone = Atomic<Bool>(false)
+        let t2 = Thread { [loop] in
+            try? loop.run()
+            secondDone.store(true, ordering: .releasing)
+        }
+        t2.start()
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(secondDone.load(ordering: .acquiring) == true,
+                "run() after shutdown must return immediately (terminal)")
     }
 
     @Test("Deterministic stale-batch event is dropped by the generation check")

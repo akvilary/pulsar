@@ -16,10 +16,13 @@ model used throughout the Starlight workspace.
 
 ## Status
 
-Early / experimental. Used by [`starlight`](https://github.com/akvilary/starlight)
-(Swift port of axum) as its multi-threaded runtime. The test suite covers the
-core contract: async read/write over a socketpair, watch channels, cross-thread
-wakeup, `Task(executorPreference:)` pinning, and read/write deadlines.
+Production-hardened reactor/executor layer. Used by
+[`starlight`](https://github.com/akvilary/starlight) (Swift port of axum)
+as its multi-threaded runtime. The test suite covers the core contract:
+async read/write over a socketpair, watch channels, cross-thread wakeup,
+`Task(executorPreference:)` pinning, read/write deadlines, shutdown
+semantics (orphan recovery, graceful in-flight unwinding, terminality),
+and pre-run task enqueue (startup lost-wakeup regression).
 
 ## Platform
 
@@ -29,7 +32,7 @@ Linux only at the syscall level (`epoll`, `eventfd`, `timerfd`). All sources are
 ## Installation
 
 ```swift
-.package(url: "https://github.com/akvilary/pulsar.git", from: "0.2.0")
+.package(url: "https://github.com/akvilary/pulsar.git", from: "0.2.1")
 ```
 
 ```swift
@@ -58,6 +61,12 @@ Task(executorPreference: loop) {
 
 // Register a watch channel — e.g. a listening socket drained with accept4(2).
 // The handler runs on the loop thread whenever the kernel reports readiness.
+//
+// ⚠️ Level-triggered readiness contract (same as mio/tokio): the handler
+// MUST drain the source (accept4(2)/read(2) until EAGAIN). An under-drained
+// level-triggered fd stays ready forever and the loop busy-spins. This is
+// inherent to readiness APIs — neither edge-triggering (missed events) nor
+// auto-draining (the loop cannot know the fd's protocol) avoids it.
 let listenId = try loop.registerWatch(fd: listenerFd, interest: .readable) { ready in
     guard ready.isReadable else { return }
     // accept4(2) until EAGAIN…
@@ -89,14 +98,66 @@ let writable = await loop.awaitWritable(channelId: id, fd: fd)  // → false on 
 // …caller performs the actual write(2)…
 ```
 
-Per-channel read buffers are pre-allocated and reused across keep-alive requests,
-so allocation per request goes to zero after warmup.
+Kernel-side, each data channel keeps ONE persistent `EPOLLONESHOT`
+registration for its whole lifetime: arming an op is a single
+`EPOLL_CTL_MOD`, and going idle costs nothing (the delivered oneshot
+auto-disables the fd). The one deliberate exception: an event carrying
+`EPOLLERR`/`EPOLLHUP`/`EPOLLRDHUP` tears the registration down when the
+channel goes idle — those bits bypass oneshot disarming (the kernel
+force-reports them), so a kept registration on a dead peer would
+busy-loop. Net effect vs the previous design: two fewer `epoll_ctl`
+syscalls per I/O cycle (~+37% echo throughput at 64 connections).
+
+**Channel teardown contract:** call `cancelChannel` BEFORE `close(2)`-ing
+the fd. The deregistration targets the fd number; closing first and
+letting the kernel recycle the number onto an unrelated registration
+would make the `EPOLL_CTL_DEL` remove that unrelated entry.
+
+Per-channel read buffers are pre-allocated (sized via
+`registerChannel(readCapacity:)`, default 8 KiB) and reused across
+keep-alive requests, so allocation per request goes to zero after warmup.
 
 ### Bounded waits (Slowloris / write-stall defence)
 
 `read` and `awaitWritable` take absolute deadlines. One periodic `timerfd` per
 loop sweeps expired deadlines on each tick (default 500 ms) and resumes the
-waiter with a sentinel — no per-op timer allocation.
+waiter with a sentinel — no per-op timer allocation. The interval
+(`timeoutSweepInterval`) is runtime-tunable: setting it while the loop runs
+re-arms the timer on the next wakeup, so live traffic can be retuned without
+a restart.
+
+The sweep survives task storms: the job drain runs on a budget (1024 jobs)
+and performs a non-blocking `epoll_wait` pass between batches, so a task
+that synchronously resumes other tasks in a tight loop cannot starve
+readiness dispatch or deadline enforcement.
+
+### Shutdown semantics
+
+`shutdown()` is **terminal** (tokio/NIO model): a subsequent `run()`
+returns immediately. The loop's exit tail
+
+- resumes every pending read/write with `-1` / `false`,
+- deregisters all channel fds, frees buffers, closes the timer,
+- drains the jobs those resurrections enqueue, so in-flight Tasks run
+  their cleanup to completion.
+
+While shutting down (and after), any further `read`/`awaitWritable` on the
+loop fails immediately with `-1` / `false` instead of trapping on the
+reset channel table — mid-flight Tasks unwind gracefully.
+
+> **Note:** tasks *spawned onto* the loop after `run()` has returned are
+> dropped and counted (`droppedJobs` gauge; a debug assertion fires at the
+> enqueue site). This is inherent — `SerialExecutor.enqueue` is synchronous
+> with no failure channel, and an `UnownedJob` cannot be faulted, only run;
+> "rescuing" the job by running it on the enqueuer's thread would execute
+> unbounded user code on a caller expecting a cheap enqueue. Orchestrated
+> shutdown (cancel watches → let in-flight Tasks fail out via `-1`/`false`
+> → `shutdown()` → join the loop thread) never drops anything: the exit
+> tail drains every job enqueued before `run()` returns.
+
+`run()` also drains jobs enqueued *before* it started, guards against
+concurrent double-`run()` (precondition), and retries transient
+`epoll_wait` errors with a backoff sleep before giving up after 32.
 
 ### Cross-thread wakeup
 
@@ -106,8 +167,12 @@ loop.wakeup()        // writes the eventfd; the next epoll_wait returns immediat
 // The loop thread then runs handleWakeup() (and the configurable onWakeup hook).
 ```
 
-Cross-thread `Task` enqueue is lock-based (spinlock + `eventfd`); same-thread
-enqueue is a plain array append — no synchronisation.
+Cross-thread `Task` enqueue is lock-based (a futex-backed `Mutex` — the
+sync `SerialExecutor.enqueue` contract makes a lock irreducible here; an
+actor would require an async hop); same-thread enqueue is a plain array
+append — no synchronisation. Gauges: `overflowEvents` counts full epoll
+batches (sizing hint for `eventsCapacity`), `droppedJobs` counts jobs
+that arrived after `run()` returned (must stay zero).
 
 ## Concurrency model & `@unchecked Sendable`
 
@@ -120,10 +185,17 @@ load-bearing, not a shortcut:
   loop that is incompatible with the cooperative pool.
 - Its mutable state (`channels`, job queues) carries `CheckedContinuation`s and a
   `~Copyable` epoll buffer that are **inherently non-`Sendable`**. They are
-  mutated **only on the loop thread**; cross-thread paths use a spinlock
-  (`poolJobs`) or atomics (`loopThreadId`, `stopped`). The `@unchecked` annotation
-  is the only way to express that invariant in today's type system — the same
-  design used by SwiftNIO's `NIOSelector` and Tokio's runtime.
+  mutated **only on the loop thread**; cross-thread paths go through exactly
+  two synchronized mechanisms: `LockedBox` — a pthread-mutex-guarded value
+  (the `NIOLockedValueBox` pattern: state is unreachable without `withLock`,
+  so discipline is type-enforced; pthread rather than
+  `Synchronization.Mutex` because the latter's Linux futex protocol is
+  invisible to ThreadSanitizer, which would make `swift test
+  --sanitize=thread` permanently noisy — the suite is kept TSan-clean) —
+  and atomics (`loopThreadId`, `stopped`, `runExited`, sweep-reschedule
+  flag, gauge mirrors). The `@unchecked` annotation is the only way to
+  express that invariant in today's type system — the same design used by
+  SwiftNIO's `NIOSelector` and Tokio's runtime.
 - Correctness is **enforced at runtime**: `checkIsolated()` compares
   `pthread_self()` against the stored `loopThreadId` (captured in `run()`, not
   `init`), so `Actor.assumeIsolated` traps immediately on any isolation
@@ -134,6 +206,8 @@ load-bearing, not a shortcut:
 ```
 Sources/Pulsar/
 ├── PollEventLoop.swift   the reactor + SerialExecutor/TaskExecutor
+├── ChannelSlab.swift     dense generation-guarded channel table (tokio-slab model)
+├── RawMutex.swift        pthread mutex + LockedBox (TSan-visible synchronisation)
 ├── PaddedAtomic.swift    128-byte cache-line-padded atomics (false-sharing guard)
 └── ReexportMIO.swift     @_exported import MIO
 ```

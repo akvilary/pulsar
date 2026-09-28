@@ -84,6 +84,7 @@
 #if os(Linux)
 
 import MIO
+import Synchronization
 
 /// Dense table of per-channel states indexed by slot, with a LIFO
 /// free-list and generation-guarded handles.
@@ -102,6 +103,23 @@ internal final class ChannelSlab {
     private(set) var capacity: Int
     /// Number of currently live (allocated) slots.
     private(set) var liveCount: Int = 0
+
+    /// Relaxed atomic mirrors for cross-thread monitoring. The stored
+    /// `liveCount` / `slotCount` vars are loop-thread state — reading
+    /// them from another thread is a data race (formally UB, TSan-
+    /// flagged, unacceptable under StrictMemorySafety). The mirrors are
+    /// updated at every mutation point on the loop thread; readers get
+    /// a race-free, merely slightly-stale snapshot.
+    private let liveGauge = Atomic<Int>(0)
+    private let slotGauge = Atomic<Int>(0)
+
+    /// Race-free gauge snapshot — number of live slots (monitoring,
+    /// any thread).
+    var liveCountApprox: Int { liveGauge.load(ordering: .relaxed) }
+
+    /// Race-free gauge snapshot — high-water mark of touched slots
+    /// (monitoring, any thread).
+    var slotCountApprox: Int { slotGauge.load(ordering: .relaxed) }
 
     /// - Precondition: `initialCapacity > 0`.
     init(initialCapacity: Int = 256) {
@@ -166,6 +184,8 @@ internal final class ChannelSlab {
         watchFlags[slot] = isWatch
         (states + slot).initialize(to: initial)
         liveCount += 1
+        liveGauge.store(liveCount, ordering: .relaxed)
+        slotGauge.store(slotCount, ordering: .relaxed)
         return (slot, gen)
     }
 
@@ -193,6 +213,7 @@ internal final class ChannelSlab {
         }
         // else: 0xFFFFFFFF → 0 wrapped — retired, not recycled.
         liveCount -= 1
+        liveGauge.store(liveCount, ordering: .relaxed)
         return state
     }
 
@@ -271,6 +292,8 @@ internal final class ChannelSlab {
         deinitializeStates()
         freeTop = 0
         slotCount = 0
+        liveGauge.store(0, ordering: .relaxed)
+        slotGauge.store(0, ordering: .relaxed)
     }
 
     // MARK: Growth

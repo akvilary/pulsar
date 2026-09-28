@@ -26,8 +26,10 @@
 //    to `drainJobs()` between waits, so a single thread drives I/O and
 //    Task progress. This is the same thread-per-core model used by the
 //    io_uring backend.
-//  * Cross-thread wakeup is via `Waker` (eventfd). Cross-thread Task
-//    enqueue uses the same spinlock-protected pool as IORingEventLoop.
+//  * Cross-thread wakeup is via `Waker` (eventfd, created in init so
+//    it exists for the loop's whole lifetime). Cross-thread Task
+//    enqueue goes through a futex-mutex-protected pool queue; the
+//    same-thread fast path is a plain array append.
 //
 //===----------------------------------------------------------------------===//
 
@@ -122,7 +124,15 @@ public final class PollEventLoop: @unchecked Sendable {
     // accidental aliasing or cross-thread sharing that `@unchecked
     // Sendable` on the previous class form silently permitted.
     private var events: Events
-    private var waker: Waker?
+    // Created in `init` (NOT `run()`) as an immutable `let`: `wakeup()`
+    // may be called from any thread at any moment after init, and a
+    // `var ... : Waker?` assigned inside `run()` would be a data race
+    // (racy optional load vs. the loop thread's store) plus a lost-
+    // wakeup window. Registry calls are thread-safe (kernel-side epoll
+    // synchronisation — see mio's Registry docs), so early registration
+    // is sound, and the eventfd now exists for the loop's whole
+    // lifetime.
+    private let waker: Waker
 
     // Periodic timer (timerfd) that wakes the loop to sweep expired
     // read/write deadlines — the mechanism bounding per-op waits
@@ -140,7 +150,24 @@ public final class PollEventLoop: @unchecked Sendable {
     /// Sweep granularity (default 500 ms). Bounds how late a deadline
     /// can be enforced; cheap because the sweep is O(active channels)
     /// and runs only on each tick, never per request.
-    public var timeoutSweepInterval: Duration = .milliseconds(500)
+    ///
+    /// Runtime-tunable: may be set at ANY time, including while the
+    /// loop is running — the setter raises a flag and wakes the loop,
+    /// which re-arms its timerfd on the next wakeup (applied within at
+    /// most one old interval + one wakeup). Backed by a Mutex so a
+    /// cross-thread `set` cannot tear against the loop thread's read.
+    private let sweepBox = LockedBox<Duration>(.milliseconds(500))
+    private let sweepReschedule = Atomic<Bool>(false)
+    public var timeoutSweepInterval: Duration {
+        get { sweepBox.withLock { $0 } }
+        set {
+            sweepBox.withLock { $0 = newValue }
+            if loopThreadId.load(ordering: .acquiring) != 0 {
+                sweepReschedule.store(true, ordering: .releasing)
+                waker.wake()
+            }
+        }
+    }
 
     // Per-channel pending-op tracking — loop thread only.
     //
@@ -163,9 +190,27 @@ public final class PollEventLoop: @unchecked Sendable {
     internal let channels = ChannelSlab(initialCapacity: 256)
 
     // Cross-thread job queue (SerialExecutor surface).
+    //
+    // Two tiers, mirroring every production reactor (SwiftNIO's
+    // EventLoop, tokio's `global_queue`): same-thread enqueues append
+    // to `loopJobs` with NO synchronisation (loop thread only);
+    // cross-thread enqueues go through `poolQueue`, a `LockedBox` —
+    // pthread-backed, so its critical sections are visible to
+    // ThreadSanitizer (`Synchronization.Mutex`'s Linux futex protocol
+    // is not, which made `--sanitize=thread` permanently noisy — see
+    // RawMutex.swift). The state is reachable only via `withLock`:
+    // the lock discipline is type-enforced, exactly like
+    // `Mutex<State>`. The previous-previous design used a
+    // `pthread_spinlock_t`, whose worst case is pathological: if the
+    // lock holder is preempted, every enqueuer burns a full scheduler
+    // quantum spinning.
+    //
+    // This queue CANNOT be an actor: `SerialExecutor.enqueue` is a
+    // synchronous protocol requirement, and actor isolation would
+    // require an async hop. A lock here is the architecturally correct
+    // tool, not a compromise.
     private var loopJobs: [UnownedJob] = []
-    private var poolJobs: [UnownedJob] = []
-    private var jobLock = pthread_spinlock_t()
+    private let poolQueue = LockedBox<[UnownedJob]>([])
     private let loopThreadId = Atomic<UInt>(0)
 
     // Loop-thread scratch for `drainJobs`. Swapping `loopJobs` into it
@@ -173,34 +218,65 @@ public final class PollEventLoop: @unchecked Sendable {
     // previous `var jobs = loopJobs; loopJobs.removeAll()` form
     // triggered, and keeps the buffer's capacity recycled across
     // drain cycles. Touched only on the loop thread, like `loopJobs`.
+    // `poolDrain` plays the same role for the mutex-protected queue:
+    // the O(1) buffer swap happens UNDER the lock (constant lock-hold
+    // time), the bulk append happens after it is released.
     private var drainBuffer: [UnownedJob] = []
+    private var poolDrain: [UnownedJob] = []
+
+    /// Job budget per `drainJobs()` call. A storm of tasks resuming
+    /// each other must not starve the reactor — readiness dispatch AND
+    /// the deadline sweep both live behind `epoll_wait`. Every N jobs
+    /// the drain performs one NON-blocking I/O service pass (see
+    /// `drainJobs`). A blocking wait there would deadlock: same-thread
+    /// enqueues carry no eventfd wake.
+    private static let maxJobsPerServicePass = 1024
 
     // Loop state.
     private let stopped = Atomic<Bool>(false)
+    /// True once `run()` has RETURNED — the loop thread is gone and
+    /// nothing can ever drain a job again. Distinct from `stopped`
+    /// (a shutdown REQUEST, during whose tail window enqueues are
+    /// still legal and drained). See `enqueueJob` for the drop policy.
+    private let runExited = Atomic<Bool>(false)
     private var consecutiveErrors: Int = 0
 
     // Stats.
+    /// Number of epoll batches that came back COMPLETELY full — i.e.
+    /// the kernel ready-list held at least `eventsCapacity` entries
+    /// and overflow may have been deferred to the next iteration.
+    /// Zero-gauge for sizing `eventsCapacity` in production. Relaxed
+    /// atomic, padded against false sharing.
     public let overflowEvents = PaddedAtomicInt64()
 
-    /// Number of currently-live channels (gauge; loop thread or a
-    /// racy cross-thread read is acceptable for monitoring).
-    public var channelsLiveCount: Int { channels.liveCount }
+    /// Jobs dropped because they were enqueued after `run()` returned
+    /// (a terminal loop can never run them). Zero in a correctly
+    /// orchestrated shutdown — a rising counter means some code still
+    /// spawns Tasks onto this dead loop; a debug assertion fires at
+    /// the enqueue site to surface it during development.
+    public let droppedJobs = PaddedAtomicInt64()
+
+    /// Number of currently-live channels (relaxed snapshot; safe from
+    /// any thread — the underlying stored counters are loop-thread
+    /// state).
+    public var channelsLiveCount: Int { channels.liveCountApprox }
 
     /// Number of slots ever touched by the channel table — its
     /// high-water mark under churn (bounded by peak concurrency, not
-    /// cumulative registrations).
-    public var channelsSlotCount: Int { channels.slotCount }
+    /// cumulative registrations). Relaxed snapshot, any thread.
+    public var channelsSlotCount: Int { channels.slotCountApprox }
 
     // User hook invoked from the loop thread after the waker fires.
     //
-    // Backed by a Mutex so a `set` from any thread cannot race with
-    // the loop thread's read in `handleWakeup`. The callback itself
-    // is invoked OUTSIDE the lock (see `handleWakeup`) so a callback
-    // that re-enters the loop (enqueue, etc.) cannot self-deadlock.
-    private let onWakeupLock = Mutex<(@Sendable () -> Void)?>(nil)
+    // Backed by a `LockedBox` so a `set` from any thread cannot race
+    // with the loop thread's read in `handleWakeup`. The callback
+    // itself is invoked OUTSIDE the lock (see `handleWakeup`) so a
+    // callback that re-enters the loop (enqueue, etc.) cannot
+    // self-deadlock.
+    private let onWakeupBox = LockedBox<(@Sendable () -> Void)?>(nil)
     public var onWakeup: (@Sendable () -> Void)? {
-        get { onWakeupLock.withLock { $0 } }
-        set { onWakeupLock.withLock { $0 = newValue } }
+        get { onWakeupBox.withLock { $0 } }
+        set { onWakeupBox.withLock { $0 = newValue } }
     }
 
     // UnownedSerialExecutor / UnownedTaskExecutor handles.
@@ -229,42 +305,99 @@ public final class PollEventLoop: @unchecked Sendable {
         self.poll = try Poll()
         self.registry = poll.registry
         self.events = Events(capacity: eventsCapacity)
-        pthread_spin_init(&jobLock, 0)
+        self.waker = try Waker(registry: registry, token: .wakeup)
     }
 
     deinit {
-        // The stored `waker`'s own deinit closes its eventfd — Waker
-        // owns the fd (mio contract); closing it here as well would
-        // double-close once the kernel recycles the number onto an
-        // unrelated fd.
-        pthread_spin_destroy(&jobLock)
-        // Defensive: a loop discarded without a completed run() may
-        // still hold live channels — free their raw read buffers (the
-        // normal path is `recoverOrphanedContinuations`, which also
-        // resumes pending continuations; none can exist without run()).
+        // Defensive teardown for a loop discarded without a completed
+        // run(). Destroying an un-resumed CheckedContinuation traps the
+        // Swift runtime ("leaked continuation"), so resume any orphans
+        // first, free the raw read buffers, and DEREGISTER the fds so a
+        // separately retained `Poll` is not left with stale kernel
+        // entries. (The normal path is run()'s tail, which also drains
+        // the resumed jobs — none of that can run here: by definition
+        // of deinit, the loop has no thread left. The resumed jobs
+        // enqueue into `poolQueue` and are, unavoidably, never run.)
         channels.forEachLive { _, state in
+            if state.pointee.registered {
+                try? registry.deregister(fd: state.pointee.fd)
+            }
+            if let cont = state.pointee.pendingRead {
+                state.pointee.pendingRead = nil
+                cont.resume(returning: -1)
+            }
+            if let cont = state.pointee.pendingWrite {
+                state.pointee.pendingWrite = nil
+                cont.resume(returning: false)
+            }
             if let buf = state.pointee.readBuffer {
                 state.pointee.readBuffer = nil
                 buf.deallocate()
             }
         }
         channels.reset()
+        // Backstop: run()'s tail normally closes the timer and stores
+        // -1; this only fires for future code paths that skip it.
+        // Capture the value BEFORE clearing the field.
+        if timerFd >= 0 {
+            let tfd = timerFd
+            timerFd = -1
+            _ = Glibc.close(tfd)
+        }
     }
 
     // MARK: Event loop
 
+    /// Drive the loop: block on `epoll_wait`, dispatch readiness, run
+    /// queued jobs, repeat until `shutdown()`.
+    ///
+    /// Lifecycle (single entry, single exit — every path, including
+    /// the fatal-error path, runs the same tail):
+    ///
+    ///   1. Terminal check — `shutdown()` is FINAL (tokio/NIO
+    ///      semantics): a `run()` after a completed (or pre-cancelled)
+    ///      run returns immediately instead of resurrecting the loop.
+    ///   2. Claim the loop-thread identity via CAS — a concurrent
+    ///      second `run()` on another thread would data-race the
+    ///      `~Copyable Events` buffer and the channel table; trap
+    ///      loudly instead of corrupting state.
+    ///   3. Arm the periodic timeout-sweep timer.
+    ///   4. Initial `drainJobs()` — jobs enqueued BEFORE `run()` (their
+    ///      enqueuers saw `loopThreadId == 0` and could not wake the
+    ///      loop) would otherwise sit in `poolQueue` while the first
+    ///      `epoll_wait` blocks forever.
+    ///   5. Loop: block-wait → count overflow → dispatch → drain.
+    ///   6. Tail (ALWAYS runs, also on the error break): recover
+    ///      orphaned waiters, deregister fds, close the timer, run the
+    ///      jobs the recoveries enqueue. The previous design `throw`n
+    ///      directly from the error path, leaking the timerfd and
+    ///      leaving pending continuations un-resumed (a guaranteed
+    ///      "leaked continuation" runtime trap at deinit).
     public func run() throws {
-        loopThreadId.store(UInt(pthread_self()), ordering: .releasing)
+        if stopped.load(ordering: .acquiring) { return }
+        // Re-open the enqueue window (an error-retry run() accepts
+        // jobs from this point on; a fresh loop starts with false).
+        runExited.store(false, ordering: .releasing)
+
+        let selfTid = UInt(pthread_self())
+        let claimed = loopThreadId.compareExchange(
+            expected: 0, desired: selfTid, ordering: .acquiringAndReleasing
+        )
+        precondition(
+            claimed.exchanged,
+            "PollEventLoop.run() is already running on thread \(claimed.original)"
+        )
         defer { loopThreadId.store(0, ordering: .releasing) }
 
-        // Register the cross-thread waker on the loop thread.
-        self.waker = try Waker(registry: registry, token: .wakeup)
+        var loopError: (any Error)?
 
-        // Register the periodic timeout-sweep timer. Failure is
-        // non-fatal: the loop still serves I/O, just without bounded
-        // waits (graceful degradation to pre-timeout behaviour).
-        if let tfd = TimerFd.create() {
-            self.timerFd = tfd
+        // Arm the periodic timeout-sweep timer. Failure is non-fatal:
+        // the loop still serves I/O, just without bounded waits
+        // (graceful degradation to pre-timeout behaviour). Re-armed
+        // per run() call — the tail closes it before returning, so an
+        // error-retry run() gets a fresh timer.
+        if timerFd < 0, let tfd = TimerFd.create() {
+            timerFd = tfd
             _ = TimerFd.setPeriodic(fd: tfd, interval: timeoutSweepInterval)
             // Level-triggered, persistent (NOT oneshot): the timer stays
             // armed and fires once per interval until drained/closed.
@@ -273,6 +406,9 @@ public final class PollEventLoop: @unchecked Sendable {
             )
         }
 
+        // See step 4 above: pick up everything enqueued before run().
+        drainJobs()
+
         while !stopped.load(ordering: .acquiring) {
             // Phase 1: block on epoll_wait until at least one source is
             // ready (or the waker fires, or a signal interrupts).
@@ -280,25 +416,32 @@ public final class PollEventLoop: @unchecked Sendable {
                 try self.events.wait(on: self.poll, timeout: PollTimeout.blocking)
                 consecutiveErrors = 0
             } catch {
-                // Recoverable errors: log, sleep briefly, retry. After 32
+                // Recoverable errors: brief sleep, retry. After 32
                 // consecutive failures give up — same threshold as the
-                // io_uring backend.
+                // io_uring backend. The sleep matters: without it the
+                // retry loop burns CPU in a tight spin for all 32
+                // attempts (the sleep was designed but missing before).
                 consecutiveErrors += 1
-                if consecutiveErrors > 32 { throw error }
+                if consecutiveErrors > 32 {
+                    loopError = error
+                    break
+                }
+                Glibc.usleep(1_000)
                 continue
+            }
+
+            // A full batch means the kernel's ready-list may have had
+            // more entries than our buffer — they stay armed and are
+            // delivered next iteration (level-triggered sources and
+            // undelivered ONESHOTs alike), but count it so operators
+            // can size `eventsCapacity` from the gauge.
+            if events.count == events.capacity {
+                _ = overflowEvents.add(1)
             }
 
             // Phase 2: dispatch each event. Channel reads/writes run the
             // actual syscall here so the resumed Task sees the result.
-            events.forEach { event in
-                if event.token == .wakeup {
-                    handleWakeup()
-                } else if event.token == Self.timerToken {
-                    handleTimer()
-                } else {
-                    processChannelEvent(event)
-                }
-            }
+            dispatchDeliveredEvents()
 
             // Phase 3: drain queued jobs (connection Tasks resuming, new
             // Tasks, etc.). Jobs enqueue themselves via `enqueue` which
@@ -308,26 +451,49 @@ public final class PollEventLoop: @unchecked Sendable {
             drainJobs()
         }
 
-        // Resume any remaining waiters with errors on shutdown.
-        // Then drain the resulting jobs: each resume enqueues a Task
-        // continuation into loopJobs/poolJobs. Without this final
+        // Shutdown/error tail — always runs. Resume any remaining
+        // waiters with errors, then drain the resulting jobs: each
+        // resume enqueues a Task continuation. Without this final
         // drain, the Tasks (which hold captures of the loop, connection
         // fds, codecs, etc.) would leak — their cleanup code (which
         // calls closeConnection and returns) never runs.
         recoverOrphanedContinuations()
         drainJobs()
 
-        // Tear down the timeout-sweep timer (loop-thread cleanup).
         if timerFd >= 0 {
             try? registry.deregister(fd: timerFd)
-            _ = Glibc.close(timerFd)
+            let tfd = timerFd
             timerFd = -1
+            _ = Glibc.close(tfd)
+        }
+
+        // The enqueue window is closed only HERE — after the final
+        // drain, so every job enqueued during the shutdown tail has
+        // already been executed. Anything arriving after this store is
+        // dropped and counted (see `enqueueJob`).
+        runExited.store(true, ordering: .releasing)
+
+        if let loopError { throw loopError }
+    }
+
+    /// Dispatch whatever `events` currently holds. Shared by the main
+    /// loop and `drainJobs`' budgeted I/O service pass.
+    @inline(__always)
+    private func dispatchDeliveredEvents() {
+        events.forEach { event in
+            if event.token == .wakeup {
+                handleWakeup()
+            } else if event.token == Self.timerToken {
+                handleTimer()
+            } else {
+                processChannelEvent(event)
+            }
         }
     }
 
     public func shutdown() {
         stopped.store(true, ordering: .releasing)
-        wakeup()
+        waker.wake()
     }
 
     /// True after `shutdown()` has been called.
@@ -339,11 +505,20 @@ public final class PollEventLoop: @unchecked Sendable {
 
     @inline(__always)
     private func handleWakeup() {
-        _ = waker?.reset()
+        _ = waker.reset()
+        // Apply a runtime `timeoutSweepInterval` change: re-arm the
+        // timerfd with the current value. The flag protocol loses no
+        // update — a setter racing this exchange re-raises the flag
+        // and wakes again.
+        if sweepReschedule.exchange(false, ordering: .acquiringAndReleasing),
+           timerFd >= 0 {
+            _ = TimerFd.setPeriodic(
+                fd: timerFd, interval: timeoutSweepInterval)
+        }
         // Read the callback under the lock, invoke it OUTSIDE so a
-        // re-entrant callback (e.g. one that enqueues on the loop)
-        // cannot take the same Mutex recursively.
-        let cb = onWakeupLock.withLock { $0 }
+        // re-entrant callback (e.g., one that enqueues on the loop)
+        // cannot take the same lock recursively.
+        let cb = onWakeupBox.withLock { $0 }
         cb?()
     }
 
@@ -411,7 +586,7 @@ public final class PollEventLoop: @unchecked Sendable {
     /// Wake the loop from any thread. The next `poll()` iteration will
     /// observe the wakeup token and invoke `onWakeup`.
     public func wakeup() {
-        _ = waker?.wake()
+        _ = waker.wake()
     }
 
     // MARK: Loop-thread contract enforcement
@@ -447,15 +622,21 @@ public final class PollEventLoop: @unchecked Sendable {
     /// plus a generation counter, so it can never be confused with a
     /// later channel that reuses the same slot (a stale handle traps
     /// with a precondition instead of acting on the new occupant).
-    /// Allocates a per-channel read buffer (8KB, reused across
-    /// keep-alive requests).
+    ///
+    /// - Parameter readCapacity: size of the per-channel read buffer,
+    ///   pre-allocated once and reused across keep-alive requests.
+    ///   Larger buffers mean fewer wakeups per byte for bulk
+    ///   transfers; the default (8 KiB) matches typical HTTP
+    ///   request/response sizing.
     ///
     /// - Precondition: called before `run()` or on the loop thread —
     ///   enforced by `precondLoopThread`.
-    public func registerChannel() -> ChannelId {
+    public func registerChannel(readCapacity: Int = 8192) -> ChannelId {
         precondLoopThread("registerChannel")
+        precondition(readCapacity > 0, "readCapacity must be positive")
         var state = PollChannelState(fd: -1)
-        state.readBuffer = .allocate(capacity: state.readCapacity)
+        state.readCapacity = readCapacity
+        state.readBuffer = .allocate(capacity: readCapacity)
         let (slot, gen) = channels.alloc(state, isWatch: false)
         return packChannelId(slot: slot, gen: gen)
     }
@@ -509,10 +690,16 @@ public final class PollEventLoop: @unchecked Sendable {
     }
 
     /// Cancel any outstanding read/write on `channelId`. Pending
-    /// continuations are resumed with `-1`. Also valid for a watch
-    /// channel: its handler closure is released when the entry is
+    /// continuations are resumed with `-1` / `false`. Also valid for a
+    /// watch channel: its handler closure is released when the entry is
     /// removed. No-op for an already-cancelled id (the generation no
     /// longer matches the slot).
+    ///
+    /// - Important: callers MUST call this BEFORE `close(2)`-ing the
+    ///   fd. The deregistration targets the fd number; if the fd were
+    ///   closed first and its number recycled by a new registration,
+    ///   the `EPOLL_CTL_DEL` would silently remove the new, unrelated
+    ///   registration.
     ///
     /// - Precondition: called before `run()` or on the loop thread —
     ///   enforced by `precondLoopThread`.
@@ -521,10 +708,13 @@ public final class PollEventLoop: @unchecked Sendable {
         guard channels.isValid(slot: channelId.slot, gen: channelId.generation)
         else { return }
         let state = channels.remove(slot: channelId.slot)
+        // Deregister FIRST — while the fd is provably still ours and
+        // the number cannot have been recycled — and before resuming
+        // any waiters (their cleanup code may close the fd).
+        if state.registered { try? registry.deregister(fd: state.fd) }
         if state.watch != nil { watchByFd.removeValue(forKey: state.fd) }
         if let cont = state.pendingRead  { cont.resume(returning: -1) }
         if let cont = state.pendingWrite { cont.resume(returning: false) }
-        if state.registered { try? registry.deregister(fd: state.fd) }
         // Free per-channel read buffer.
         if let buf = state.readBuffer { buf.deallocate() }
     }
@@ -597,10 +787,21 @@ public final class PollEventLoop: @unchecked Sendable {
         // (or pre-run setup). Enforced here so a mispinned caller fails
         // at the first state mutation, not as a cross-thread race.
         precondLoopThread("read")
-        precondition(
-            channels.isValid(slot: channelId.slot, gen: channelId.generation),
-            "PollEventLoop.armRead: stale channel handle — use after cancelChannel"
-        )
+        // Shutdown is terminal: fail the wait immediately instead of
+        // arming an interest nobody will ever deliver. This is what
+        // lets in-flight Tasks unwind cleanly DURING shutdown — after
+        // the tail resets the channel table, their handles are stale
+        // and the old code trapped on the "stale handle" precondition
+        // in exactly this path.
+        if stopped.load(ordering: .acquiring) {
+            cont.resume(returning: -1)
+            return
+        }
+        guard channels.isValid(slot: channelId.slot, gen: channelId.generation) else {
+            preconditionFailure(
+                "PollEventLoop.armRead: stale channel handle — use after cancelChannel (\(channelId))"
+            )
+        }
         let state = channels.pointer(slot: channelId.slot)
         // A watch channel's events are dispatched to its handler and
         // never reach the continuation path — arming a read there
@@ -643,10 +844,14 @@ public final class PollEventLoop: @unchecked Sendable {
     ///   dereferenced only inside synchronous `write(2)` attempts.
     /// - Precondition: no other write wait may be in flight on the
     ///   same `channelId`.
+    /// - Precondition: called on the loop thread (the optimistic
+    ///   `write(2)` touches the same connection state as the armed
+    ///   wait) — enforced by `precondLoopThread`.
     public func write(
         channelId: ChannelId, fd: CInt,
         from buffer: UnsafeRawBufferPointer
     ) async -> Int {
+        precondLoopThread("write")
         var offset = 0
         while offset < buffer.count {
             let n = Glibc.write(
@@ -689,12 +894,20 @@ public final class PollEventLoop: @unchecked Sendable {
         cont: CheckedContinuation<Bool, Never>,
         deadline: ContinuousClock.Instant?
     ) {
-        // See armRead: the awaiting Task must be loop-pinned.
+        // See armRead: the awaiting Task must be loop-pinned, and a
+        // terminal shutdown fails the wait gracefully (false) rather
+        // than arming an undeliverable interest or trapping on the
+        // reset table.
         precondLoopThread("awaitWritable/write")
-        precondition(
-            channels.isValid(slot: channelId.slot, gen: channelId.generation),
-            "PollEventLoop.armWritable: stale channel handle — use after cancelChannel"
-        )
+        if stopped.load(ordering: .acquiring) {
+            cont.resume(returning: false)
+            return
+        }
+        guard channels.isValid(slot: channelId.slot, gen: channelId.generation) else {
+            preconditionFailure(
+                "PollEventLoop.armWritable: stale channel handle — use after cancelChannel (\(channelId))"
+            )
+        }
         let state = channels.pointer(slot: channelId.slot)
         // Symmetric to armRead: a write-wait armed on a watch channel
         // would never be resumed.
@@ -711,26 +924,50 @@ public final class PollEventLoop: @unchecked Sendable {
     // MARK: Re-arm logic
 
     /// Recompute the interest mask for the channel based on currently
-    /// pending ops, then ADD or MOD the fd. Called after each op is
+    /// pending ops, then MOD or ADD the fd. Called after each op is
     /// armed and after each event is processed.
     ///
+    /// Registration model (nginx-style persistent registration):
+    /// once a data channel's fd is first ADDed, the registration STAYS
+    /// in the kernel for the channel's whole lifetime. Arming an op is
+    /// a single `EPOLL_CTL_MOD`; going idle does NOTHING — the
+    /// delivered `EPOLLONESHOT` event auto-disabled the fd, so a spent
+    /// registration reports no further readiness, and the next arm
+    /// re-enables it with one MOD. This removes the ADD+DEL pair the
+    /// previous design paid on every I/O cycle (2 `epoll_ctl` syscalls
+    /// per request — MOD alone is also the cheapest mutation: no
+    /// rbtree insert/erase, just an in-place mask write).
+    ///
+    /// The ONE exception is `deregisterIfIdle`: `EPOLLERR`/`EPOLLHUP`
+    /// (and defensively `EPOLLRDHUP`) BYPASS ONESHOT disarming — the
+    /// kernel force-includes them in every readiness poll of a linked
+    /// item — so a kept registration on a dead peer would re-deliver
+    /// the level-triggered HUP on every `epoll_wait`, a 100% CPU
+    /// busy-loop. When an error/hangup event is being processed and
+    /// the channel is going idle, the entry MUST be removed.
+    ///
     /// Mutates the state IN PLACE through the slot pointer — no local
-    /// copy, no write-back (the previous dictionary design paid a
-    /// copy-out and a write-back per call). The registration token
-    /// carries the handle `(slot, gen)` verbatim so delivered events
-    /// resolve back to this exact allocation.
+    /// copy, no write-back. The registration token carries the handle
+    /// `(slot, gen)` verbatim so delivered events resolve back to this
+    /// exact allocation.
+    ///
+    /// - Parameter deregisterIfIdle: tear the registration down if no
+    ///   interest remains (set when the event being processed carried
+    ///   ERR/HUP/RDHUP — see above).
     private func rearm(
         slot: Int, gen: UInt32,
-        state: UnsafeMutablePointer<PollChannelState>
+        state: UnsafeMutablePointer<PollChannelState>,
+        deregisterIfIdle: Bool = false
     ) {
         var interest: Interest = []
         if state.pointee.pendingRead != nil  { interest.insert(.readable) }
         if state.pointee.pendingWrite != nil { interest.insert(.writable) }
 
-        // If nothing is pending, deregister to free the epoll slot —
-        // otherwise the kernel keeps a dangling interest entry.
+        // Nothing pending. The spent ONESHOT registration stays (it is
+        // auto-disabled — silent until the next MOD), UNLESS the peer
+        // is dying: see the HUP busy-loop note in the doc comment.
         guard !interest.isEmpty else {
-            if state.pointee.registered {
+            if deregisterIfIdle, state.pointee.registered {
                 try? registry.deregister(fd: state.pointee.fd)
                 state.pointee.registered = false
             }
@@ -744,15 +981,27 @@ public final class PollEventLoop: @unchecked Sendable {
         let token = packChannelId(slot: slot, gen: gen).asToken
         do {
             if state.pointee.registered {
-                try registry.reregister(
-                    fd: state.pointee.fd, token: token, interest: interest
-                )
+                do {
+                    try registry.reregister(
+                        fd: state.pointee.fd, token: token, interest: interest
+                    )
+                } catch {
+                    // The `registered` flag has exactly one way to go
+                    // stale: the caller closed the fd behind the loop's
+                    // back (against the documented cancel-before-close
+                    // contract) — `close(2)` auto-removes the kernel
+                    // entry, so MOD fails with ENOENT. Heal with a
+                    // fresh ADD instead of failing both waiters.
+                    try registry.register(
+                        fd: state.pointee.fd, token: token, interest: interest
+                    )
+                }
             } else {
                 try registry.register(
                     fd: state.pointee.fd, token: token, interest: interest
                 )
-                state.pointee.registered = true
             }
+            state.pointee.registered = true
         } catch {
             // EBADF / ENOMEM: surface as immediate error to the
             // caller(s) by resuming with -1. The table stays
@@ -760,10 +1009,12 @@ public final class PollEventLoop: @unchecked Sendable {
             // BEFORE resume (a resumed Task re-enters via drainJobs).
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
+                state.pointee.readDeadline = nil
                 cont.resume(returning: -1)
             }
             if let cont = state.pointee.pendingWrite {
                 state.pointee.pendingWrite = nil
+                state.pointee.writeDeadline = nil
                 cont.resume(returning: false)
             }
         }
@@ -809,12 +1060,20 @@ public final class PollEventLoop: @unchecked Sendable {
         let fd = state.pointee.fd
 
         // Read readiness: issue read(2) into internal buffer, resume waiter.
+        // EINTR is retried — a signal landing on the syscall must not
+        // surface as a spurious -1 ("error") that tears the connection
+        // down (the caller-visible result of this branch IS the read's
+        // return value).
         if event.isReadable, let cont = state.pointee.pendingRead {
             state.pointee.pendingRead = nil
             state.pointee.readDeadline = nil
-            let n = Glibc.read(
-                fd, state.pointee.readBuffer!, state.pointee.readCapacity)
-            cont.resume(returning: Int(n))
+            var n: Int = -1
+            while true {
+                n = Glibc.read(
+                    fd, state.pointee.readBuffer!, state.pointee.readCapacity)
+                if n >= 0 || errno != EINTR { break }
+            }
+            cont.resume(returning: n)
         }
 
         // Write readiness: the caller owns the buffer and performs the
@@ -865,15 +1124,30 @@ public final class PollEventLoop: @unchecked Sendable {
             cont.resume(returning: 0)
         }
 
-        // Re-arm with whatever is still pending. If both directions
-        // were satisfied, this deregisters.
-        rearm(slot: slot, gen: gen, state: state)
+        // Re-arm with whatever is still pending. If the event carried
+        // ERR/HUP/RDHUP, pass `deregisterIfIdle` so a channel going
+        // idle on a dead peer drops its kernel registration — those
+        // bits bypass ONESHOT disarming and would otherwise re-deliver
+        // forever (see `rearm`).
+        rearm(
+            slot: slot, gen: gen, state: state,
+            deregisterIfIdle: event.ready.isError || event.ready.isHangup
+                || event.ready.contains(.readHangup)
+        )
     }
 
     // MARK: Orphan recovery
 
     private func recoverOrphanedContinuations() {
         channels.forEachLive { _, state in
+            // Mirror the kernel state: every live channel's epoll entry
+            // is removed so a separately retained `Poll` sees no stale
+            // registrations (the table is about to be wiped, so no
+            // later cancelChannel can do this).
+            if state.pointee.registered {
+                try? registry.deregister(fd: state.pointee.fd)
+                state.pointee.registered = false
+            }
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
                 cont.resume(returning: -1)
@@ -883,9 +1157,7 @@ public final class PollEventLoop: @unchecked Sendable {
                 cont.resume(returning: false)
             }
             // Free per-channel read buffers here as well: the raw
-            // allocations are NOT released by state deinitialization
-            // (the previous dictionary design leaked them on this
-            // path — only `cancelChannel` freed them).
+            // allocations are NOT released by state deinitialization.
             if let buf = state.pointee.readBuffer {
                 state.pointee.readBuffer = nil
                 buf.deallocate()
@@ -895,7 +1167,6 @@ public final class PollEventLoop: @unchecked Sendable {
         // handler) as well as the channel states.
         channels.reset()
         watchByFd.removeAll()
-        _ = overflowEvents.increment()
     }
 
     /// White-box probe for tests (`@testable`): whether a read
@@ -916,46 +1187,87 @@ public final class PollEventLoop: @unchecked Sendable {
     /// of a freshly-spawned `Task { ... }` is enqueued as a separate
     /// job after the Task's setup job runs. A single-pass drain would
     /// leave the body job in `loopJobs` until the next drainJobs()
-    /// call (after the next poll.poll() round-trip), which with
-    /// blocking epoll_wait means "forever".
+    /// call (after the next poll() round-trip), which with blocking
+    /// epoll_wait means "forever".
+    ///
+    /// Job budget: every `maxJobsPerServicePass` jobs, one
+    /// NON-blocking epoll pass services pending I/O (including the
+    /// timerfd — so deadline enforcement survives task storms). A
+    /// task that synchronously resumes other tasks in a tight loop
+    /// can no longer starve the reactor indefinitely. Blocking here
+    /// instead would deadlock: same-thread enqueues carry no wake, so
+    /// nothing would ever fire the epoll_wait.
     private func drainJobs() {
+        var served = 0
         while true {
             // Move the loop-local queue into the scratch buffer via an
             // O(1) CoW buffer exchange — no element copy, and the
-            // buffer's capacity is recycled across drain cycles. The
-            // previous `var jobs = loopJobs; loopJobs.removeAll()`
-            // form triggered a CoW deep-copy of every queued job
-            // because both names shared the buffer at mutation time.
+            // buffer's capacity is recycled across drain cycles.
             // loopJobs is loop-thread-only, so no lock.
             swap(&drainBuffer, &loopJobs)
 
-            if !poolJobs.isEmpty {
-                pthread_spin_lock(&jobLock)
-                drainBuffer.append(contentsOf: poolJobs)
-                poolJobs.removeAll(keepingCapacity: true)
-                pthread_spin_unlock(&jobLock)
+            // Move the cross-thread queue across with an O(1) buffer
+            // swap UNDER the lock (constant lock-hold time — the bulk
+            // append happens after release). All `poolQueue` access
+            // is under its LockedBox lock (TSan-verifiable); the
+            // previous design additionally read the pool queue's
+            // `isEmpty` WITHOUT any lock — a genuine data race.
+            poolQueue.withLock {
+                swap(&poolDrain, &$0)
+            }
+            if !poolDrain.isEmpty {
+                drainBuffer.append(contentsOf: poolDrain)
+                poolDrain.removeAll(keepingCapacity: true)
             }
             if drainBuffer.isEmpty { return }
 
             for job in drainBuffer {
                 job.runSynchronously(on: cachedExecutor)
+                served &+= 1
+                if served == Self.maxJobsPerServicePass {
+                    served = 0
+                    _ = try? events.wait(on: poll, timeout: PollTimeout.immediate)
+                    dispatchDeliveredEvents()
+                }
             }
             drainBuffer.removeAll(keepingCapacity: true)
         }
     }
 
     private func enqueueJob(_ job: UnownedJob) {
-        let tid = loopThreadId.load(ordering: .acquiring)
-        let cur = UInt(pthread_self())
-        if cur == tid {
-            loopJobs.append(job)
-        } else {
-            pthread_spin_lock(&jobLock)
-            poolJobs.append(job)
-            let needWake = tid != 0
-            pthread_spin_unlock(&jobLock)
-            if needWake { wakeup() }
+        // Terminal: the loop thread is gone; this job can never run.
+        // `SerialExecutor.enqueue` is synchronous with no failure
+        // channel, so the options are drop, trap, or "rescue". The
+        // rescue is rejected on architecture grounds: hijacking the
+        // enqueuer's thread runs unbounded user code on a caller that
+        // expects a cheap enqueue (deadlocks if it holds a lock the
+        // job needs), and a dedicated drainer thread has no sound exit
+        // condition and races a restart. Drop + count + debug-assert
+        // instead: loud in development, observable in production
+        // metrics, never crashes a shutting-down server over a
+        // straggler. (An UnownedJob cannot be faulted or cancelled —
+        // running it is its only fate, and there is no thread left.)
+        if runExited.load(ordering: .acquiring) {
+            _ = droppedJobs.add(1)
+            assertionFailure(
+                "PollEventLoop: job enqueued after run() returned — the loop " +
+                "is terminal; this job will never run (see droppedJobs)"
+            )
+            return
         }
+        let tid = loopThreadId.load(ordering: .acquiring)
+        if UInt(pthread_self()) == tid {
+            loopJobs.append(job)
+            return
+        }
+        let needWake = poolQueue.withLock { (queue: inout [UnownedJob]) -> Bool in
+            queue.append(job)
+            return tid != 0
+        }
+        // The waker exists from init onward, so this can never be a
+        // lost wakeup. (Jobs enqueued pre-run see tid == 0, skip the
+        // wake, and are picked up by run()'s initial drainJobs.)
+        if needWake { waker.wake() }
     }
 }
 
