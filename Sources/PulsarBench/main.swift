@@ -43,12 +43,14 @@ func elapsedSeconds(since start: ContinuousClock.Instant) -> Double {
 
 func phaseChurn() -> Double {
     let loop = try! PollEventLoop()
+    let fd = Glibc.open("/dev/null", O_RDONLY)
     let N = 200_000
     let t0 = ContinuousClock.now
     for _ in 0..<N {
-        let id = loop.registerChannel()
+        let id = try! loop.registerChannel(fd: fd)
         loop.cancelChannel(id)
     }
+    _ = Glibc.close(fd)
     let dt = elapsedSeconds(since: t0)
     return Double(N) / dt
 }
@@ -73,7 +75,7 @@ func phaseEcho(connections: Int, seconds: Double) async {
     let K = connections
     let pairs: [(CInt, CInt)] = (0..<K).map { _ in makePair() }
     // Id type is inferred: UInt32 (dict) or ChannelId (slab).
-    let ids = (0..<K).map { _ in loop.registerChannel() }
+    let ids = (0..<K).map { try! loop.registerChannel(fd: pairs[$0].1) }
 
     let loopThread = Thread { [loop] in try? loop.run() }
     loopThread.start()
@@ -108,7 +110,7 @@ func phaseEcho(connections: Int, seconds: Double) async {
         let id = ids[i]
         tasks.append(Task(executorPreference: loop) { [loop] in
             while true {
-                let n = await loop.read(channelId: id, fd: fd)
+                let n = await loop.read(channelId: id)
                 _ = readCalls.add(1, ordering: .relaxed)
                 if n > 0 {
                     _ = totalBytes.add(Int64(n), ordering: .relaxed)

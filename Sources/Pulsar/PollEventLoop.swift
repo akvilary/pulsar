@@ -80,7 +80,16 @@ import Glibc
 /// the sub-1% gain). The watch/data dispatch decision itself reads the
 /// slab's parallel `watchFlags` byte array and IS fully static.
 internal struct PollChannelState {
+    /// The fd the loop OWNS — a `dup(2)` of the caller's, made at
+    /// registration (see `adoptFd`). Every syscall on the channel
+    /// (`read`/`write`/`epoll_ctl`/`close`) uses THIS number, whose
+    /// recycling is impossible until the loop itself closes it.
     var fd: CInt
+    /// The CALLER's original fd number — kept only so watch channels
+    /// can be removed from `watchByFd` (whose public surface,
+    /// `cancelWatch(fd:)`, speaks the caller's number). -1 for data
+    /// channels.
+    var origFd: CInt = -1
     var registered: Bool = false
     var pendingRead: CheckedContinuation<Int, Never>?
     /// Absolute deadline after which a pending read is considered timed
@@ -312,16 +321,18 @@ public final class PollEventLoop: @unchecked Sendable {
         // Defensive teardown for a loop discarded without a completed
         // run(). Destroying an un-resumed CheckedContinuation traps the
         // Swift runtime ("leaked continuation"), so resume any orphans
-        // first, free the raw read buffers, and DEREGISTER the fds so a
-        // separately retained `Poll` is not left with stale kernel
-        // entries. (The normal path is run()'s tail, which also drains
-        // the resumed jobs — none of that can run here: by definition
-        // of deinit, the loop has no thread left. The resumed jobs
-        // enqueue into `poolQueue` and are, unavoidably, never run.)
+        // first, free the raw read buffers, and release every loop-
+        // owned dup (deregister + close) so neither fds nor kernel
+        // entries leak. (The normal path is run()'s tail, which also
+        // drains the resumed jobs — none of that can run here: by
+        // definition of deinit, the loop has no thread left. The
+        // resumed jobs enqueue into `poolQueue` and are, unavoidably,
+        // never run.)
         channels.forEachLive { _, state in
             if state.pointee.registered {
                 try? registry.deregister(fd: state.pointee.fd)
             }
+            _ = Glibc.close(state.pointee.fd)
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
                 cont.resume(returning: -1)
@@ -617,24 +628,79 @@ public final class PollEventLoop: @unchecked Sendable {
 
     // MARK: Channel management
 
-    /// Allocate a fresh channel handle. Use the returned id with
-    /// `read`/`write`/`cancelChannel`. The id encodes the slab slot
-    /// plus a generation counter, so it can never be confused with a
-    /// later channel that reuses the same slot (a stale handle traps
-    /// with a precondition instead of acting on the new occupant).
+    /// Adopt `fd` into the loop's ownership: duplicate it
+    /// (`F_DUPFD_CLOEXEC`) and enforce `O_NONBLOCK`.
     ///
+    /// The dup is what makes the ownership model sound: the loop's
+    /// descriptor number can never be recycled behind its back (the
+    /// kernel recycles a number only after the LAST reference closes —
+    /// and the loop holds one), so `EPOLL_CTL_DEL` / `close(2)` at
+    /// teardown always target precisely this channel's registration.
+    /// The old cancel-before-close contract dissolves: callers may
+    /// close their own fd at any moment (their close is not the last
+    /// reference — the connection stays live until `cancelChannel`).
+    ///
+    /// `O_NONBLOCK` is enforced because a blocking fd would wedge the
+    /// loop thread inside `read(2)`/`write(2)` — the single worst
+    /// failure mode this library can have. NOTE: `O_NONBLOCK` is a
+    /// property of the open file DESCRIPTION shared by the caller's fd
+    /// and this dup — setting it changes the caller's fd flags too.
+    /// That is deliberate: a reactor requires non-blocking sources,
+    /// and this makes misuse impossible. Typical non-blocking fds
+    /// (`accept4(SOCK_NONBLOCK)`) pay one `F_GETFL` only.
+    private static func adoptFd(_ fd: CInt) throws -> CInt {
+        let owned = Glibc.fcntl(fd, F_DUPFD_CLOEXEC, 0)
+        guard owned >= 0 else {
+            // Construct the error BEFORE any other syscall: a later
+            // call (even a succeeding close) is not guaranteed by
+            // POSIX to leave errno untouched.
+            throw PollError.fromErrno(function: "fcntl(F_DUPFD_CLOEXEC)")
+        }
+        let flags = Glibc.fcntl(owned, F_GETFL)
+        guard flags >= 0 else {
+            let error = PollError.fromErrno(function: "fcntl(F_GETFL)")
+            _ = Glibc.close(owned)
+            throw error
+        }
+        if flags & Int32(O_NONBLOCK) == 0 {
+            guard Glibc.fcntl(owned, F_SETFL, flags | Int32(O_NONBLOCK)) >= 0 else {
+                let error = PollError.fromErrno(function: "fcntl(F_SETFL, O_NONBLOCK)")
+                _ = Glibc.close(owned)
+                throw error
+            }
+        }
+        return owned
+    }
+
+    /// Allocate a fresh channel handle bound to `fd`. The loop dups the
+    /// fd (see `adoptFd`) and owns the duplicate for the channel's
+    /// lifetime — `cancelChannel` releases it (deregister + close). Use
+    /// the returned id with `read`/`write`/`awaitWritable`/
+    /// `cancelChannel`; the id encodes the slab slot plus a generation
+    /// counter, so it can never be confused with a later channel that
+    /// reuses the same slot (a stale handle traps with a precondition
+    /// instead of acting on the new occupant).
+    ///
+    /// - Parameter fd: the caller's fd. From this point the caller MAY
+    ///   close it at any time (recommended right after this call, to
+    ///   conserve the fd quota): the loop works through its own dup,
+    ///   and the connection stays live until `cancelChannel`.
     /// - Parameter readCapacity: size of the per-channel read buffer,
     ///   pre-allocated once and reused across keep-alive requests.
     ///   Larger buffers mean fewer wakeups per byte for bulk
     ///   transfers; the default (8 KiB) matches typical HTTP
     ///   request/response sizing.
     ///
+    /// - Throws: `PollError` if the fd is invalid or its flags cannot
+    ///   be read/set.
     /// - Precondition: called before `run()` or on the loop thread —
     ///   enforced by `precondLoopThread`.
-    public func registerChannel(readCapacity: Int = 8192) -> ChannelId {
+    public func registerChannel(
+        fd: CInt, readCapacity: Int = 8192
+    ) throws -> ChannelId {
         precondLoopThread("registerChannel")
         precondition(readCapacity > 0, "readCapacity must be positive")
-        var state = PollChannelState(fd: -1)
+        var state = PollChannelState(fd: try Self.adoptFd(fd))
         state.readCapacity = readCapacity
         state.readBuffer = .allocate(capacity: readCapacity)
         let (slot, gen) = channels.alloc(state, isWatch: false)
@@ -669,19 +735,26 @@ public final class PollEventLoop: @unchecked Sendable {
         _ handler: @Sendable @escaping (Ready) -> Void
     ) throws -> ChannelId {
         precondLoopThread("registerWatch")
-        var state = PollChannelState(fd: fd)
+        // The loop adopts a dup of the listener (see `adoptFd`); the
+        // handler keeps using the CALLER's number for accept(2) — both
+        // refer to the same open file description. Keep the caller's fd
+        // open while the watch is registered.
+        let owned = try Self.adoptFd(fd)
+        var state = PollChannelState(fd: owned)
+        state.origFd = fd
         state.watch = handler
         let (slot, gen) = channels.alloc(state, isWatch: true)
         let handle = packChannelId(slot: slot, gen: gen)
         do {
-            try registry.register(fd: fd, token: handle.asToken, interest: interest)
+            try registry.register(fd: owned, token: handle.asToken, interest: interest)
         } catch {
             // Roll the slot back: the caller sees the error and holds
-            // no handle, so a live slot (and its stored closure) would
-            // otherwise leak until shutdown. `remove` also bumps the
-            // generation, so the token that may have partially reached
-            // the kernel is already stale.
+            // no handle, so a live slot (and its stored closure, and
+            // the adopted dup) would otherwise leak until shutdown.
+            // `remove` also bumps the generation, so the token that
+            // may have partially reached the kernel is already stale.
             _ = channels.remove(slot: slot)
+            _ = Glibc.close(owned)
             throw error
         }
         channels.pointer(slot: slot).pointee.registered = true
@@ -695,11 +768,11 @@ public final class PollEventLoop: @unchecked Sendable {
     /// removed. No-op for an already-cancelled id (the generation no
     /// longer matches the slot).
     ///
-    /// - Important: callers MUST call this BEFORE `close(2)`-ing the
-    ///   fd. The deregistration targets the fd number; if the fd were
-    ///   closed first and its number recycled by a new registration,
-    ///   the `EPOLL_CTL_DEL` would silently remove the new, unrelated
-    ///   registration.
+    /// Releases the loop-owned descriptor (deregister + close): the
+    /// connection is fully torn down by this call. Both operations
+    /// target the loop's own `dup(2)` — a number that cannot have been
+    /// recycled — so teardown is precise by construction, whatever the
+    /// caller did with their own fd.
     ///
     /// - Precondition: called before `run()` or on the loop thread —
     ///   enforced by `precondLoopThread`.
@@ -708,11 +781,12 @@ public final class PollEventLoop: @unchecked Sendable {
         guard channels.isValid(slot: channelId.slot, gen: channelId.generation)
         else { return }
         let state = channels.remove(slot: channelId.slot)
-        // Deregister FIRST — while the fd is provably still ours and
-        // the number cannot have been recycled — and before resuming
-        // any waiters (their cleanup code may close the fd).
+        // DEL first: if the caller still holds their own fd, closing
+        // our dup would not remove the kernel entry (the file stays
+        // open via their reference).
         if state.registered { try? registry.deregister(fd: state.fd) }
-        if state.watch != nil { watchByFd.removeValue(forKey: state.fd) }
+        if state.watch != nil { watchByFd.removeValue(forKey: state.origFd) }
+        _ = Glibc.close(state.fd)
         if let cont = state.pendingRead  { cont.resume(returning: -1) }
         if let cont = state.pendingWrite { cont.resume(returning: false) }
         // Free per-channel read buffer.
@@ -738,9 +812,10 @@ public final class PollEventLoop: @unchecked Sendable {
 
     // MARK: Async read
 
-    /// Await readability on `(channelId, fd)`, then read into the
-    /// eventLoop's internal per-channel buffer. Returns bytes read
-    /// (0 on EOF, -1 on error, -2 on timeout).
+    /// Await readability on `channelId`, then read into the eventLoop's
+    /// internal per-channel buffer. Returns bytes read (0 on EOF, -1 on
+    /// error, -2 on timeout). The fd was bound at `registerChannel(fd:)`
+    /// — the loop reads through its own dup of it.
     ///
     /// The buffer is owned by the eventLoop — callers access it via
     /// `getReadView(channelId:count:)` after this returns. This
@@ -752,11 +827,11 @@ public final class PollEventLoop: @unchecked Sendable {
     ///   the timeout (compat). Enforced by `sweepTimeouts` on each
     ///   timerfd tick, so granularity ≈ `timeoutSweepInterval`.
     public func read(
-        channelId: ChannelId, fd: CInt,
+        channelId: ChannelId,
         deadline: ContinuousClock.Instant? = nil
     ) async -> Int {
         return await withCheckedContinuation { cont in
-            armRead(channelId: channelId, fd: fd, cont: cont, deadline: deadline)
+            armRead(channelId: channelId, cont: cont, deadline: deadline)
         }
     }
 
@@ -778,7 +853,7 @@ public final class PollEventLoop: @unchecked Sendable {
     }
 
     private func armRead(
-        channelId: ChannelId, fd: CInt,
+        channelId: ChannelId,
         cont: CheckedContinuation<Int, Never>,
         deadline: ContinuousClock.Instant?
     ) {
@@ -808,7 +883,6 @@ public final class PollEventLoop: @unchecked Sendable {
         // would hang the awaiting Task forever. Fail fast instead.
         precondition(state.pointee.watch == nil,
             "PollEventLoop: async read is unavailable on watch channels — the handler owns the I/O")
-        state.pointee.fd = fd
         precondition(state.pointee.pendingRead == nil,
             "PollEventLoop: overlapping read on channelId=\(channelId)")
         state.pointee.pendingRead = cont
@@ -837,23 +911,29 @@ public final class PollEventLoop: @unchecked Sendable {
     /// never suspends: the optimistic `write(2)` succeeds and the loop
     /// returns without crossing an await. Only a full socket buffer
     /// triggers `awaitWritable`, which suspends this Task while the
-    /// loop serves other connections.
+    /// loop serves other connections. The write goes through the
+    /// loop-owned dup bound at registration; validity is re-checked
+    /// every iteration, so a channel cancelled while this Task was
+    /// suspended stops the loop instead of writing through a dead
+    /// handle.
     ///
     /// - Precondition: the caller MUST own `buffer` for the duration
     ///   of this call (across any internal await). The pointer is
     ///   dereferenced only inside synchronous `write(2)` attempts.
     /// - Precondition: no other write wait may be in flight on the
     ///   same `channelId`.
-    /// - Precondition: called on the loop thread (the optimistic
-    ///   `write(2)` touches the same connection state as the armed
-    ///   wait) — enforced by `precondLoopThread`.
+    /// - Precondition: called on the loop thread — enforced by
+    ///   `precondLoopThread`.
     public func write(
-        channelId: ChannelId, fd: CInt,
+        channelId: ChannelId,
         from buffer: UnsafeRawBufferPointer
     ) async -> Int {
         precondLoopThread("write")
         var offset = 0
         while offset < buffer.count {
+            guard channels.isValid(slot: channelId.slot, gen: channelId.generation)
+            else { break }
+            let fd = channels.pointer(slot: channelId.slot).pointee.fd
             let n = Glibc.write(
                 fd, buffer.baseAddress!.advanced(by: offset),
                 buffer.count - offset
@@ -862,7 +942,7 @@ public final class PollEventLoop: @unchecked Sendable {
             if n == 0 { break }          // socket: shouldn't happen
             if errno == EINTR { continue }
             if errno == EAGAIN || errno == EWOULDBLOCK {
-                if !(await awaitWritable(channelId: channelId, fd: fd)) {
+                if !(await awaitWritable(channelId: channelId)) {
                     break                 // error / hangup
                 }
                 continue
@@ -872,7 +952,7 @@ public final class PollEventLoop: @unchecked Sendable {
         return offset
     }
 
-    /// Await writability on `(channelId, fd)`. Arms `EPOLLOUT` (oneshot),
+    /// Await writability on `channelId`. Arms `EPOLLOUT` (oneshot),
     /// suspends, and resumes with `true` when the socket can accept a
     /// write, or `false` on `EPOLLERR` / `EPOLLHUP` / timeout.
     ///
@@ -881,16 +961,16 @@ public final class PollEventLoop: @unchecked Sendable {
     /// - Parameter deadline: absolute time after which an unanswered
     ///   readiness wait is failed with `false`. `nil` disables it.
     public func awaitWritable(
-        channelId: ChannelId, fd: CInt,
+        channelId: ChannelId,
         deadline: ContinuousClock.Instant? = nil
     ) async -> Bool {
         await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-            armWritable(channelId: channelId, fd: fd, cont: cont, deadline: deadline)
+            armWritable(channelId: channelId, cont: cont, deadline: deadline)
         }
     }
 
     private func armWritable(
-        channelId: ChannelId, fd: CInt,
+        channelId: ChannelId,
         cont: CheckedContinuation<Bool, Never>,
         deadline: ContinuousClock.Instant?
     ) {
@@ -913,7 +993,6 @@ public final class PollEventLoop: @unchecked Sendable {
         // would never be resumed.
         precondition(state.pointee.watch == nil,
             "PollEventLoop: async write is unavailable on watch channels — the handler owns the I/O")
-        state.pointee.fd = fd
         precondition(state.pointee.pendingWrite == nil,
             "PollEventLoop: overlapping write on channelId=\(channelId) — previous continuation would leak")
         state.pointee.pendingWrite = cont
@@ -1140,14 +1219,15 @@ public final class PollEventLoop: @unchecked Sendable {
 
     private func recoverOrphanedContinuations() {
         channels.forEachLive { _, state in
-            // Mirror the kernel state: every live channel's epoll entry
-            // is removed so a separately retained `Poll` sees no stale
-            // registrations (the table is about to be wiped, so no
-            // later cancelChannel can do this).
+            // Mirror the kernel state and release the loop-owned dup:
+            // the table is about to be wiped, so no later cancelChannel
+            // can do this. DEL first (the caller may still hold their
+            // own fd — closing our dup alone would not remove the
+            // entry), then close.
             if state.pointee.registered {
                 try? registry.deregister(fd: state.pointee.fd)
-                state.pointee.registered = false
             }
+            _ = Glibc.close(state.pointee.fd)
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
                 cont.resume(returning: -1)

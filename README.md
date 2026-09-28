@@ -32,7 +32,7 @@ Linux only at the syscall level (`epoll`, `eventfd`, `timerfd`). All sources are
 ## Installation
 
 ```swift
-.package(url: "https://github.com/akvilary/pulsar.git", from: "0.2.1")
+.package(url: "https://github.com/akvilary/pulsar.git", from: "0.3.0")
 ```
 
 ```swift
@@ -92,9 +92,9 @@ precondition instead of acting on the slot's new occupant.
 
 ```swift
 // Inside a Task pinned to the loop:
-let n = await loop.read(channelId: id, fd: fd)            // bytes; 0=EOF, -1=err, -2=timeout
+let n = await loop.read(channelId: id)                    // bytes; 0=EOF, -1=err, -2=timeout
 let view = loop.getReadView(channelId: id, count: n)      // borrowed view, no memcpy
-let writable = await loop.awaitWritable(channelId: id, fd: fd)  // → false on write-timeout
+let writable = await loop.awaitWritable(channelId: id)    // → false on write-timeout
 // …caller performs the actual write(2)…
 ```
 
@@ -108,13 +108,25 @@ force-reports them), so a kept registration on a dead peer would
 busy-loop. Net effect vs the previous design: two fewer `epoll_ctl`
 syscalls per I/O cycle (~+37% echo throughput at 64 connections).
 
-**Channel teardown contract:** call `cancelChannel` BEFORE `close(2)`-ing
-the fd. The deregistration targets the fd number; closing first and
-letting the kernel recycle the number onto an unrelated registration
-would make the `EPOLL_CTL_DEL` remove that unrelated entry.
+**fd ownership:** `registerChannel(fd:)` adopts the fd — the loop dups
+it (`F_DUPFD_CLOEXEC`), forces `O_NONBLOCK` (a blocking fd would wedge
+the loop thread; note `O_NONBLOCK` is a property of the shared open
+file description, so this flips the caller's fd non-blocking too —
+deliberately: a reactor requires non-blocking sources), and owns the
+duplicate for the channel's lifetime. `cancelChannel` releases it
+(deregister + close) and fully tears the connection down. Because the
+loop only ever touches ITS OWN descriptor number — which the kernel
+cannot recycle until the loop itself closes it — teardown is precise
+by construction: there is no cancel-before-close ordering to get wrong.
+Callers may close their own fd at any time (recommended right after
+registering, to conserve the fd quota): their close is not the last
+reference, and the connection stays live until `cancelChannel`. One
+socket, one channel: epoll keys registrations by open file
+description, so a second channel dup'ed from the same socket fails its
+first arm with a clean `-1` instead of hanging.
 
 Per-channel read buffers are pre-allocated (sized via
-`registerChannel(readCapacity:)`, default 8 KiB) and reused across
+`registerChannel(fd:readCapacity:)`, default 8 KiB) and reused across
 keep-alive requests, so allocation per request goes to zero after warmup.
 
 ### Bounded waits (Slowloris / write-stall defence)
