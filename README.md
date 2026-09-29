@@ -20,9 +20,14 @@ Production-hardened reactor/executor layer. Used by
 [`starlight`](https://github.com/akvilary/starlight) (Swift port of axum)
 as its multi-threaded runtime. The test suite covers the core contract:
 async read/write over a socketpair, watch channels, cross-thread wakeup,
-`Task(executorPreference:)` pinning, read/write deadlines, shutdown
-semantics (orphan recovery, graceful in-flight unwinding, terminality),
-and pre-run task enqueue (startup lost-wakeup regression).
+`Task(executorPreference:)` pinning, read/write deadlines (including
+`write`'s whole-operation deadline), errno discrimination
+(`lastErrno(channelId:)`), spurious-readiness handling, SIGPIPE
+immunity on the socket write path (`MSG_NOSIGNAL`), shutdown semantics
+(orphan recovery, graceful in-flight unwinding, terminality,
+leak-free window closing), pre-run task enqueue (startup lost-wakeup
+regression), a concurrency stress test with slot churn and mid-flight
+cancellations, and a ThreadSanitizer-clean run enforced in CI.
 
 ## Platform
 
@@ -32,7 +37,7 @@ Linux only at the syscall level (`epoll`, `eventfd`, `timerfd`). All sources are
 ## Installation
 
 ```swift
-.package(url: "https://github.com/akvilary/pulsar.git", from: "0.3.1")
+.package(url: "https://github.com/akvilary/pulsar.git", from: "0.4.0")
 ```
 
 ```swift
@@ -96,7 +101,28 @@ let n = await loop.read(channelId: id)                    // bytes; 0=EOF, -1=er
 let view = loop.getReadView(channelId: id, count: n)      // borrowed view, no memcpy
 let writable = await loop.awaitWritable(channelId: id)    // → false on write-timeout
 // …caller performs the actual write(2)…
+
+// Whole-write deadline (stalled-peer defence — see below):
+let w = await loop.write(channelId: id, from: buf, deadline: .now + .seconds(10))
+
+// Error discrimination — why did that call return -1 / false / -2?
+switch loop.lastErrno(channelId: id) {
+case 0:            break              // clean completion / EOF
+case ETIMEDOUT:    break              // a deadline expired (read returned -2)
+case ECANCELED:    break              // wait cancelled / shutdown / teardown
+case EPIPE:        break              // peer gone (send reports it, no SIGPIPE)
+case let e:        fatalError("io error \(e)")
+}
 ```
+
+Reads are one maximal `read(2)` per readiness event — with a fixed
+destination buffer that is provably optimal (a short read on a stream
+fd means the kernel had nothing more; a full read filled the buffer),
+so the bulk-throughput lever is `readCapacity`, not extra syscalls.
+Spurious readiness (epoll reports readable, `read(2)` returns
+`EAGAIN`) does **not** fail the wait: the continuation stays armed and
+the interest is re-armed — the tokio semantics; a healthy connection
+is never torn down over a spurious wakeup.
 
 Kernel-side, each data channel keeps ONE persistent `EPOLLONESHOT`
 registration for its whole lifetime: arming an op is a single
@@ -124,6 +150,22 @@ reference, and the connection stays live until `cancelChannel`. One
 socket, one channel: epoll keys registrations by open file
 description, so a second channel dup'ed from the same socket fails its
 first arm with a clean `-1` instead of hanging.
+
+**SIGPIPE:** socket channels are probed once at registration
+(`getsockopt(SO_TYPE)`) and write through `send(2)` with
+`MSG_NOSIGNAL` — a peer that closes mid-write yields a clean
+`-1` + `lastErrno == EPIPE` instead of a signal that would kill the
+process. Non-socket channels (pipes, files) use plain `write(2)`;
+embedders driving EPIPE-prone pipe channels must arrange their own
+`SIGPIPE` disposition.
+
+**Setup threading contract:** all channel registration/cancellation is
+loop-thread state. Before `run()` it is legal from any single thread
+(the conventional register-then-run pattern — the thread spawn itself
+provides the happens-before into `run()`); concurrent registration
+from two threads before `run()` is a contract violation (unsynchronised
+table growth). While the loop runs, only the loop thread (i.e. Tasks
+pinned to it).
 
 Per-channel read buffers are pre-allocated (sized via
 `registerChannel(fd:readCapacity:)`, default 8 KiB) and reused across
@@ -155,12 +197,16 @@ violation regardless of the flag.
 
 ### Bounded waits (Slowloris / write-stall defence)
 
-`read` and `awaitWritable` take absolute deadlines. One periodic `timerfd` per
-loop sweeps expired deadlines on each tick (default 500 ms) and resumes the
-waiter with a sentinel — no per-op timer allocation. The interval
-(`timeoutSweepInterval`) is runtime-tunable: setting it while the loop runs
-re-arms the timer on the next wakeup, so live traffic can be retuned without
-a restart.
+`read`, `awaitWritable` **and `write`** take absolute deadlines — for
+`write` the deadline bounds the WHOLE operation (checked at every
+writability wait; the optimistic write attempts never block), so a
+stalled peer can no longer hang an unbounded write: it returns the
+partial byte count and records `lastErrno == ETIMEDOUT`. One periodic
+`timerfd` per loop sweeps expired deadlines on each tick (default
+500 ms) and resumes the waiter with a sentinel — no per-op timer
+allocation. The interval (`timeoutSweepInterval`) is runtime-tunable:
+setting it while the loop runs re-arms the timer on the next wakeup,
+so live traffic can be retuned without a restart.
 
 The sweep survives task storms: the job drain runs on a budget (1024 jobs)
 and performs a non-blocking `epoll_wait` pass between batches, so a task
@@ -181,15 +227,19 @@ While shutting down (and after), any further `read`/`awaitWritable` on the
 loop fails immediately with `-1` / `false` instead of trapping on the
 reset channel table — mid-flight Tasks unwind gracefully.
 
-> **Note:** tasks *spawned onto* the loop after `run()` has returned are
-> dropped and counted (`droppedJobs` gauge; a debug assertion fires at the
-> enqueue site). This is inherent — `SerialExecutor.enqueue` is synchronous
-> with no failure channel, and an `UnownedJob` cannot be faulted, only run;
-> "rescuing" the job by running it on the enqueuer's thread would execute
-> unbounded user code on a caller expecting a cheap enqueue. Orchestrated
-> shutdown (cancel watches → let in-flight Tasks fail out via `-1`/`false`
-> → `shutdown()` → join the loop thread) never drops anything: the exit
-> tail drains every job enqueued before `run()` returns.
+> **Note:** tasks *spawned onto* the loop after its windows have closed
+> are dropped and counted (`droppedJobs` gauge; a debug assertion fires
+> at the enqueue site). This is inherent — `SerialExecutor.enqueue` is
+> synchronous with no failure channel, and an `UnownedJob` cannot be
+> faulted, only run; "rescuing" the job by running it on the enqueuer's
+> thread would execute unbounded user code on a caller expecting a
+> cheap enqueue. The window closing itself is race-free: the terminal
+> flag is stored UNDER the queue locks and both producers check it
+> INSIDE the same locks, so a straggler is either drained by the tail
+> (before the close) or failed/dropped inline (after it) — nothing can
+> be parked in a box with no drainer left. Orchestrated shutdown
+> (cancel watches → let in-flight Tasks fail out via `-1`/`false` →
+> `shutdown()` → join the loop thread) never drops anything.
 
 `run()` also drains jobs enqueued *before* it started, guards against
 concurrent double-`run()` (precondition), and retries transient

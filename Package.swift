@@ -18,7 +18,15 @@ let package = Package(
         .library(name: "Pulsar", targets: ["Pulsar"]),
     ],
     dependencies: [
-        .package(path: "../mio"),
+        // Published dependency — the exact form every consumer
+        // (starlight included) resolves: mio is fetched from GitHub
+        // within the version bound below. A `path: "../mio"`
+        // dependency works only inside the local workspace layout and
+        // is uninstallable for consumers of a published tag — the
+        // release process must never carry one. To develop pulsar
+        // against local mio changes, tag/push mio (or temporarily
+        // switch this line to a path dep) and bump the bound.
+        .package(url: "https://github.com/akvilary/mio.git", from: "0.3.0"),
     ],
     targets: [
         .target(

@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 //
 //  PollEventLoop.swift
-//  StarlightPoll
+//  Pulsar
 //
 //  High-level Swift Concurrency event loop built on top of the low-level
 //  `Poll` / `Registry` / `Waker` primitives from the `mio` package
@@ -11,7 +11,7 @@
 //  driven by readiness notifications on a single epoll fd instead of
 //  io_uring submissions.
 //
-//  The mio primitives are re-exported, so `import StarlightPoll` is
+//  The mio primitives are re-exported, so `import Pulsar` is
 //  sufficient to reach `Poll`, `Token`, `Interest`, `Ready`, etc.
 //
 //  Design notes
@@ -145,6 +145,31 @@ internal struct PollChannelState {
     /// decoder). Eliminates @unchecked on H1Conn + ConnState.
     var readBuffer: UnsafeMutablePointer<UInt8>?
     var readCapacity: Int = 8192
+    /// True iff the adopted fd is a socket (probed once at
+    /// registration via `getsockopt(SO_TYPE)`). Sockets write through
+    /// `send(2)` + `MSG_NOSIGNAL`, which turns a peer-close race into
+    /// a clean `-1`/`EPIPE` instead of a process-killing `SIGPIPE` —
+    /// `write(2)` would deliver the signal, and this library must
+    /// never kill the process over a dead peer. Non-socket channels
+    /// (pipes, files) keep `write(2)`: `send` requires a socket.
+    /// Loop-thread state, like every other field.
+    var isSocket: Bool = false
+    /// errno of the most recently COMPLETED operation on this channel
+    /// (loop thread only — read via `lastErrno(channelId:)`). Written
+    /// by exactly the sites that complete a wait or a direct syscall:
+    ///   * `0`                  — success (data read, full write,
+    ///                            wait satisfied, EOF observed)
+    ///   * real errno           — the failing `read(2)`/`send(2)`/
+    ///                            `write(2)`/`epoll_ctl` errno
+    ///   * `ETIMEDOUT`          — a deadline expired (read: `-2`)
+    ///   * `ECANCELED`          — cancelled wait / shutdown failure /
+    ///                            teardown recovery
+    ///   * `EIO`                — EPOLLERR on a wait (real errno not
+    ///                            observable without attempting I/O)
+    ///   * `EPIPE`              — write-wait failed via EPOLLHUP
+    /// Trivial `CInt` — no ARC traffic, no layout impact on the hot
+    /// path.
+    var lastErrno: CInt = 0
 }
 
 // MARK: - PollEventLoop
@@ -198,11 +223,21 @@ public final class PollEventLoop: @unchecked Sendable {
     /// which re-arms its timerfd on the next wakeup (applied within at
     /// most one old interval + one wakeup). Backed by a Mutex so a
     /// cross-thread `set` cannot tear against the loop thread's read.
+    ///
+    /// Must be strictly positive (enforced): `.zero` maps to timerfd
+    /// DISARM in mio, which would silently disable every deadline —
+    /// the sweep would never run again; values below timer resolution
+    /// degrade the loop to a near-busy spin.
     private let sweepBox = LockedBox<Duration>(.milliseconds(500))
     private let sweepReschedule = Atomic<Bool>(false)
     public var timeoutSweepInterval: Duration {
         get { sweepBox.withLock { $0 } }
         set {
+            precondition(
+                newValue > .zero,
+                "timeoutSweepInterval must be strictly positive " +
+                "(.zero would disarm the sweep timer and silently " +
+                "disable all deadline enforcement)")
             sweepBox.withLock { $0 = newValue }
             if loopThreadId.load(ordering: .acquiring) != 0 {
                 sweepReschedule.store(true, ordering: .releasing)
@@ -276,10 +311,13 @@ public final class PollEventLoop: @unchecked Sendable {
 
     // Loop state.
     private let stopped = Atomic<Bool>(false)
-    /// True once `run()` has RETURNED — the loop thread is gone and
-    /// nothing can ever drain a job again. Distinct from `stopped`
-    /// (a shutdown REQUEST, during whose tail window enqueues are
-    /// still legal and drained). See `enqueueJob` for the drop policy.
+    /// True once the loop's enqueue/request windows have CLOSED (in
+    /// run()'s tail, under the queue locks — see the tail's two-phase
+    /// protocol). Distinct from `stopped` (a shutdown REQUEST, during
+    /// whose tail window enqueues are still legal and drained): after
+    /// `runExited`, cross-thread jobs are dropped+counted and arm
+    /// requests are failed inline — nothing can be parked in a box
+    /// with no drainer left. See `enqueueJob` / `submitRequest`.
     private let runExited = Atomic<Bool>(false)
     private var consecutiveErrors: Int = 0
 
@@ -385,10 +423,12 @@ public final class PollEventLoop: @unchecked Sendable {
             _ = Glibc.close(state.pointee.fd)
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
+                state.pointee.lastErrno = ECANCELED
                 cont.resume(returning: -1)
             }
             if let cont = state.pointee.pendingWrite {
                 state.pointee.pendingWrite = nil
+                state.pointee.lastErrno = ECANCELED
                 cont.resume(returning: false)
             }
             if let buf = state.pointee.readBuffer {
@@ -431,7 +471,9 @@ public final class PollEventLoop: @unchecked Sendable {
     ///   5. Loop: block-wait → count overflow → dispatch → drain.
     ///   6. Tail (ALWAYS runs, also on the error break): recover
     ///      orphaned waiters, deregister fds, close the timer, run the
-    ///      jobs the recoveries enqueue. The previous design `throw`n
+    ///      jobs the recoveries enqueue, and close the enqueue/request
+    ///      windows in two flag-under-lock phases (see the tail's
+    ///      protocol notes). The previous design `throw`n
     ///      directly from the error path, leaking the timerfd and
     ///      leaving pending continuations un-resumed (a guaranteed
     ///      "leaked continuation" runtime trap at deinit).
@@ -519,8 +561,41 @@ public final class PollEventLoop: @unchecked Sendable {
         // drain, the Tasks (which hold captures of the loop, connection
         // fds, codecs, etc.) would leak — their cleanup code (which
         // calls closeConnection and returns) never runs.
+        //
+        // The tail closes the enqueue/request windows in TWO phases,
+        // each phase = flag store UNDER the corresponding queue's lock
+        // + a drain after it (the check-inside-lock protocol — see
+        // `submitRequest` / `enqueueJob`):
+        //
+        //   1. recover orphans          (resumes → jobs)
+        //   2. drainJobs                (recovered Tasks run their
+        //                                 cleanup; they may submit arm
+        //                                 requests — handled by 4)
+        //   3. close REQUEST window     (loopRequests lock + flag)
+        //   4. drain pending requests   (straggler arms failed →
+        //                                 resumes → more jobs)
+        //   5. close JOB window         (poolQueue lock + flag)
+        //   6. drainJobs                (runs everything from 1-4 and
+        //                                 same-thread spawns; drains
+        //                                 until BOTH queues empty)
+        //
+        // The phase ORDER is load-bearing: the job window must close
+        // AFTER the request drain (whose resumes enqueue jobs), and a
+        // final drainJobs must follow it — otherwise the request-fail
+        // resumes' jobs would land after the last drain, never run,
+        // and never be counted. After phase 5, any cross-thread
+        // enqueue sees the flag and is dropped+counted; any late
+        // submitRequest is failed inline. NOTHING can be parked in a
+        // box with no drainer left.
         recoverOrphanedContinuations()
+        drainJobs()
+        loopRequests.withLock { _ in
+            runExited.store(true, ordering: .releasing)
+        }
         drainPendingLoopRequests()
+        poolQueue.withLock { _ in
+            runExited.store(true, ordering: .releasing)
+        }
         drainJobs()
 
         if timerFd >= 0 {
@@ -529,12 +604,6 @@ public final class PollEventLoop: @unchecked Sendable {
             timerFd = -1
             _ = Glibc.close(tfd)
         }
-
-        // The enqueue window is closed only HERE — after the final
-        // drain, so every job enqueued during the shutdown tail has
-        // already been executed. Anything arriving after this store is
-        // dropped and counted (see `enqueueJob`).
-        runExited.store(true, ordering: .releasing)
 
         if let loopError { throw loopError }
     }
@@ -618,6 +687,7 @@ public final class PollEventLoop: @unchecked Sendable {
         cont: CheckedContinuation<Int, Never>
     ) {
         if call.cancelled.load(ordering: .acquiring) {
+            setErrno(ECANCELED, on: channelId)
             cont.resume(returning: -1)
             return
         }
@@ -631,6 +701,7 @@ public final class PollEventLoop: @unchecked Sendable {
         cont: CheckedContinuation<Bool, Never>
     ) {
         if call.cancelled.load(ordering: .acquiring) {
+            setErrno(ECANCELED, on: channelId)
             cont.resume(returning: false)
             return
         }
@@ -668,6 +739,7 @@ public final class PollEventLoop: @unchecked Sendable {
             state.pointee.pendingRead = nil
             state.pointee.pendingReadCall = nil
             state.pointee.readDeadline = nil
+            state.pointee.lastErrno = ECANCELED
             rearm(slot: channelId.slot, gen: channelId.generation, state: state)
             cont.resume(returning: -1)
         } else {
@@ -677,6 +749,7 @@ public final class PollEventLoop: @unchecked Sendable {
             state.pointee.pendingWrite = nil
             state.pointee.pendingWriteCall = nil
             state.pointee.writeDeadline = nil
+            state.pointee.lastErrno = ECANCELED
             rearm(slot: channelId.slot, gen: channelId.generation, state: state)
             cont.resume(returning: false)
         }
@@ -733,6 +806,7 @@ public final class PollEventLoop: @unchecked Sendable {
             state.pointee.pendingRead = nil
             state.pointee.pendingReadCall = nil
             state.pointee.readDeadline = nil
+            state.pointee.lastErrno = ETIMEDOUT
             cont.resume(returning: -2)  // read-timeout sentinel
         }
         for (slot, cont) in writeTimedOut {
@@ -741,6 +815,7 @@ public final class PollEventLoop: @unchecked Sendable {
             state.pointee.pendingWrite = nil
             state.pointee.pendingWriteCall = nil
             state.pointee.writeDeadline = nil
+            state.pointee.lastErrno = ETIMEDOUT
             cont.resume(returning: false)  // write-timeout (≡ error → bail)
         }
     }
@@ -823,6 +898,16 @@ public final class PollEventLoop: @unchecked Sendable {
         return owned
     }
 
+    /// True iff `fd` is a socket — one `getsockopt(SO_TYPE)` probe on
+    /// the cold registration path. Drives the `send(MSG_NOSIGNAL)` vs
+    /// `write(2)` decision in `write` (see `PollChannelState.isSocket`).
+    private static func fdIsSocket(_ fd: CInt) -> Bool {
+        var sockType: CInt = 0
+        var len = socklen_t(MemoryLayout<CInt>.size)
+        return getsockopt(
+            fd, SOL_SOCKET, SO_TYPE, &sockType, &len) == 0
+    }
+
     /// Allocate a fresh channel handle bound to `fd`. The loop dups the
     /// fd (see `adoptFd`) and owns the duplicate for the channel's
     /// lifetime — `cancelChannel` releases it (deregister + close). Use
@@ -845,15 +930,23 @@ public final class PollEventLoop: @unchecked Sendable {
     /// - Throws: `PollError` if the fd is invalid or its flags cannot
     ///   be read/set.
     /// - Precondition: called before `run()` or on the loop thread —
-    ///   enforced by `precondLoopThread`.
+    ///   enforced by `precondLoopThread`. Pre-`run()` setup is
+    ///   single-threaded by contract: the channel table is plain
+    ///   memory with no synchronisation, so two threads registering
+    ///   concurrently race table growth (use-after-free). Sequential
+    ///   setup from different threads is fine if externally
+    ///   synchronised — the canonical register-then-`run()` pattern
+    ///   gets that happens-before edge from the thread spawn itself.
     public func registerChannel(
         fd: CInt, readCapacity: Int = 8192
     ) throws -> ChannelId {
         precondLoopThread("registerChannel")
         precondition(readCapacity > 0, "readCapacity must be positive")
-        var state = PollChannelState(fd: try Self.adoptFd(fd))
+        let ownedFd = try Self.adoptFd(fd)
+        var state = PollChannelState(fd: ownedFd)
         state.readCapacity = readCapacity
         state.readBuffer = .allocate(capacity: readCapacity)
+        state.isSocket = Self.fdIsSocket(ownedFd)
         let (slot, gen) = channels.alloc(state, isWatch: false)
         return packChannelId(slot: slot, gen: gen)
     }
@@ -938,6 +1031,10 @@ public final class PollEventLoop: @unchecked Sendable {
         if state.registered { try? registry.deregister(fd: state.fd) }
         if state.watch != nil { watchByFd.removeValue(forKey: state.origFd) }
         _ = Glibc.close(state.fd)
+        // lastErrno is NOT recorded here — the slot is vacated, so the
+        // moved-out value is unobservable; `lastErrno(channelId:)`
+        // reports ECANCELED for the stale handle by rule (an op that
+        // ended via teardown was, by definition, cancelled).
         if let cont = state.pendingRead  { cont.resume(returning: -1) }
         if let cont = state.pendingWrite { cont.resume(returning: false) }
         // Free per-channel read buffer.
@@ -993,8 +1090,13 @@ public final class PollEventLoop: @unchecked Sendable {
         cancellable: Bool = false
     ) async -> Int {
         // Cheap hygiene on every path: a task already cancelled must
-        // not arm a wait at all.
-        if Task.isCancelled { return -1 }
+        // not arm a wait at all. The errno record is thread-guarded:
+        // a cancellable call's entry may run on the global pool (see
+        // setErrnoIfLoopThread), where the table must not be touched.
+        if Task.isCancelled {
+            setErrnoIfLoopThread(ECANCELED, channelId)
+            return -1
+        }
         if !cancellable {
             // Hot path: the arm happens synchronously in THIS frame —
             // which runs on the caller's executor (the loop for
@@ -1038,6 +1140,72 @@ public final class PollEventLoop: @unchecked Sendable {
         )
     }
 
+    /// Record `e` as the channel's last outcome. Loop-thread only;
+    /// a stale handle is a silent no-op — the slot may since have been
+    /// vacated (or reused by a different channel), and writing through
+    /// it would corrupt the new occupant. Every completion site routes
+    /// through this or sets the field in-place through a validated
+    /// slot pointer.
+    @inline(__always)
+    private func setErrno(_ e: CInt, on channelId: ChannelId) {
+        guard channels.isValid(slot: channelId.slot, gen: channelId.generation)
+        else { return }
+        channels.pointer(slot: channelId.slot).pointee.lastErrno = e
+    }
+
+    /// `setErrno`, but only when executing in a regime that owns the
+    /// channel table: the loop thread, or the tid == 0 setup/terminal
+    /// regime (mirroring `precondLoopThread`). The `read` /
+    /// `awaitWritable` ENTRY fast-fails run on the caller's thread —
+    /// which for a cancellable call may be the global pool (Swift's
+    /// cancellation wrapper hops there), and touching the table from
+    /// there would race the loop. A non-cancellable contract violation
+    /// still traps at the arm's `precondLoopThread`, untouched.
+    @inline(__always)
+    private func setErrnoIfLoopThread(_ e: CInt, _ channelId: ChannelId) {
+        let tid = loopThreadId.load(ordering: .acquiring)
+        if tid == 0 || UInt(pthread_self()) == tid {
+            setErrno(e, on: channelId)
+        }
+    }
+
+    /// errno of the most recently completed operation on the channel —
+    /// the discrimination layer over `read`/`write`/`awaitWritable`
+    /// return values:
+    ///
+    ///   * `0` — clean completion (data delivered, full write,
+    ///     writability granted, EOF observed).
+    ///   * real errno — the failing syscall (`EPIPE`, `EBADF`,
+    ///     `ECONNRESET`…), captured at the failure site before
+    ///     anything can clobber it.
+    ///   * `ETIMEDOUT` — a deadline expired (`read` returned `-2`).
+    ///   * `ECANCELED` — the wait was cancelled, or failed because the
+    ///     loop is shutting down / the channel was torn down.
+    ///   * `EIO` / `EPIPE` — an armed wait failed via `EPOLLERR` /
+    ///     `EPOLLHUP` respectively (the kernel reports no errno for
+    ///     these; the values are what an attempted syscall would
+    ///     return).
+    ///
+    /// A stale handle also reports `ECANCELED`: an op that ended while
+    /// its channel was being torn down was, by definition, cancelled.
+    ///
+    /// Valid to call immediately after the awaited call returns, from
+    /// the same Task (the value is stable until the channel's next
+    /// completed operation — sequential ops on one channel are the
+    /// supported model). Cancellable calls made from a NON-loop-pinned
+    /// task resume on the global pool — such a caller must hop to the
+    /// loop (a loop-pinned actor, or re-arming on the loop) before
+    /// querying, per the precondition below.
+    ///
+    /// - Precondition: called on the loop thread — enforced by
+    ///   `precondLoopThread`.
+    public func lastErrno(channelId: ChannelId) -> CInt {
+        precondLoopThread("lastErrno")
+        guard channels.isValid(slot: channelId.slot, gen: channelId.generation)
+        else { return ECANCELED }
+        return channels.pointer(slot: channelId.slot).pointee.lastErrno
+    }
+
     private func armRead(
         channelId: ChannelId,
         cont: CheckedContinuation<Int, Never>,
@@ -1056,6 +1224,7 @@ public final class PollEventLoop: @unchecked Sendable {
         // and the old code trapped on the "stale handle" precondition
         // in exactly this path.
         if stopped.load(ordering: .acquiring) {
+            setErrno(ECANCELED, on: channelId)
             cont.resume(returning: -1)
             return
         }
@@ -1090,13 +1259,13 @@ public final class PollEventLoop: @unchecked Sendable {
     // caller writes) follows buffer ownership: the loop owns the read
     // destination buffer, the caller owns the write source buffer.
 
-    /// Optimistic `write(2)` loop over `buffer`; on `EAGAIN` arms
-    /// `EPOLLOUT` and awaits readiness via `awaitWritable`. Returns
+    /// Optimistic `send(2)`/`write(2)` loop over `buffer`; on `EAGAIN`
+    /// arms `EPOLLOUT` and awaits readiness via `awaitWritable`. Returns
     /// total bytes written (0..buffer.count).
     ///
     /// Runs entirely on the caller's executor (the loop thread for
     /// loop-pinned callers). The fast path — socket buffer has room —
-    /// never suspends: the optimistic `write(2)` succeeds and the loop
+    /// never suspends: the optimistic write succeeds and the loop
     /// returns without crossing an await. Only a full socket buffer
     /// triggers `awaitWritable`, which suspends this Task while the
     /// loop serves other connections. The write goes through the
@@ -1105,9 +1274,22 @@ public final class PollEventLoop: @unchecked Sendable {
     /// suspended stops the loop instead of writing through a dead
     /// handle.
     ///
+    /// Sockets write via `send(2)` with `MSG_NOSIGNAL`: a peer that
+    /// closes mid-write yields a clean `-1`/`EPIPE` (visible through
+    /// `lastErrno(channelId:)`) instead of a `SIGPIPE` that would kill
+    /// the whole process. Non-socket channels (pipes, files) use plain
+    /// `write(2)` — `MSG_NOSIGNAL` requires a socket; embedders
+    /// driving pipe channels through EPIPE-prone paths must arrange
+    /// their own `SIGPIPE` disposition.
+    ///
+    /// - Parameter deadline: absolute time bounding the WHOLE write
+    ///   (checked at every writability wait; the optimistic write
+    ///   attempts themselves never block). `nil` disables the timeout.
+    ///   A stalled peer can no longer hang an unbounded write — the
+    ///   write-stall counterpart of `read`'s deadline.
     /// - Precondition: the caller MUST own `buffer` for the duration
     ///   of this call (across any internal await). The pointer is
-    ///   dereferenced only inside synchronous `write(2)` attempts.
+    ///   dereferenced only inside synchronous write attempts.
     /// - Precondition: no other write wait may be in flight on the
     ///   same `channelId`.
     /// - Precondition: called on the loop thread — enforced by
@@ -1115,31 +1297,52 @@ public final class PollEventLoop: @unchecked Sendable {
     public func write(
         channelId: ChannelId,
         from buffer: UnsafeRawBufferPointer,
+        deadline: ContinuousClock.Instant? = nil,
         cancellable: Bool = false
     ) async -> Int {
         precondLoopThread("write")
         var offset = 0
+        // errno outcome for THIS call, applied once at the end (the
+        // channel stays untouched while the loop runs):
+        //   0    — every byte written (or a zero-length request)
+        //   e    — the failing syscall's errno, captured at the site
+        //   nil  — the outcome was recorded by a wait-completion site
+        //          (awaitWritable's failure path sets lastErrno there);
+        //          writing here would overwrite it
+        var outcome: CInt? = 0
         while offset < buffer.count {
             guard channels.isValid(slot: channelId.slot, gen: channelId.generation)
-            else { break }
-            let fd = channels.pointer(slot: channelId.slot).pointee.fd
-            let n = Glibc.write(
-                fd, buffer.baseAddress!.advanced(by: offset),
-                buffer.count - offset
-            )
-            if n > 0 { offset += Int(n); continue }
+            else {
+                outcome = nil   // channel gone; slot may be reused — hands off
+                break
+            }
+            let state = channels.pointer(slot: channelId.slot)
+            let fd = state.pointee.fd
+            let chunk = UnsafeRawBufferPointer(
+                rebasing: buffer[offset...])
+            let n: Int
+            if state.pointee.isSocket {
+                n = Glibc.send(fd, chunk.baseAddress!, chunk.count, Int32(MSG_NOSIGNAL))
+            } else {
+                n = Glibc.write(fd, chunk.baseAddress!, chunk.count)
+            }
+            if n > 0 { offset += n; continue }
             if n == 0 { break }          // socket: shouldn't happen
             if errno == EINTR { continue }
             if errno == EAGAIN || errno == EWOULDBLOCK {
                 if !(await awaitWritable(
-                    channelId: channelId, cancellable: cancellable)
+                    channelId: channelId, deadline: deadline,
+                    cancellable: cancellable)
                 ) {
-                    break                 // error / hangup / cancellation
+                    outcome = nil        // recorded by the wait's failure site
+                    break                // error / hangup / timeout / cancel
                 }
                 continue
             }
-            break                         // EPIPE / EBADF / ...
+            outcome = errno              // EPIPE / EBADF / ... — captured now
+            break
         }
+        if let e = outcome { setErrno(e, on: channelId) }
         return offset
     }
 
@@ -1161,7 +1364,12 @@ public final class PollEventLoop: @unchecked Sendable {
         deadline: ContinuousClock.Instant? = nil,
         cancellable: Bool = false
     ) async -> Bool {
-        if Task.isCancelled { return false }
+        // See `read`: thread-guarded errno record (a cancellable call
+        // may enter on the global pool).
+        if Task.isCancelled {
+            setErrnoIfLoopThread(ECANCELED, channelId)
+            return false
+        }
         if !cancellable {
             return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
                 armWritable(channelId: channelId, cont: cont, deadline: deadline)
@@ -1182,13 +1390,33 @@ public final class PollEventLoop: @unchecked Sendable {
 
     /// Append a loop request and wake the loop. Callable from ANY
     /// thread (the cancellable paths use it from the global pool and
-    /// from the cancelling thread). If the loop has already exited,
-    /// un-appliable ARM requests are failed immediately instead of
-    /// parking their continuation in a box nobody drains (the residual
-    /// nano-window against a concurrent exit is the documented
-    /// post-terminal contract — see `droppedJobs`).
+    /// from the cancelling thread).
+    ///
+    /// Terminal-check discipline: the check that `runExited` is false
+    /// happens INSIDE the box lock, and run()'s tail flips the flag
+    /// UNDER THE SAME LOCK before its final drain. The two locked
+    /// sections are therefore strictly ordered: either this append
+    /// lands before the close (and the tail's drain fails the request
+    /// properly), or this check sees the flag and the request is
+    /// failed here. The previous design checked the flag BEFORE taking
+    /// the lock, which left an interleaving where an append raced past
+    /// the tail's drain AND the flag store — a continuation parked in
+    /// a box nobody would ever drain (its Task hangs forever). Same
+    /// protocol as `enqueueJob`'s job-window close.
     private func submitRequest(_ request: LoopRequest) {
-        if runExited.load(ordering: .acquiring) {
+        var terminal = false
+        loopRequests.withLock {
+            if runExited.load(ordering: .relaxed) {
+                terminal = true
+            } else {
+                $0.append(request)
+            }
+        }
+        // Resume OUTSIDE the lock: a resume enqueues a job, and even
+        // though that takes poolQueue's lock (not this one), keeping
+        // critical sections minimal is the discipline that makes the
+        // protocol auditable.
+        if terminal {
             switch request {
             case let .armRead(_, _, _, cont):
                 cont.resume(returning: -1)
@@ -1197,10 +1425,9 @@ public final class PollEventLoop: @unchecked Sendable {
             case .cancel:
                 break
             }
-            return
+        } else {
+            waker.wake()
         }
-        loopRequests.withLock { $0.append(request) }
-        waker.wake()
     }
 
     private func armWritable(
@@ -1215,6 +1442,7 @@ public final class PollEventLoop: @unchecked Sendable {
         // reset table.
         precondLoopThread("awaitWritable/write")
         if stopped.load(ordering: .acquiring) {
+            setErrno(ECANCELED, on: channelId)
             cont.resume(returning: false)
             return
         }
@@ -1322,16 +1550,22 @@ public final class PollEventLoop: @unchecked Sendable {
             // caller(s) by resuming with -1. The table stays
             // consistent — continuation fields are nilled in the slot
             // BEFORE resume (a resumed Task re-enters via drainJobs).
+            // The failing epoll_ctl's errno rides on PollError.code
+            // (captured race-free at mio's C layer); anything else is
+            // recorded as EIO.
+            let err = (error as? PollError)?.code ?? EIO
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
                 state.pointee.pendingReadCall = nil
                 state.pointee.readDeadline = nil
+                state.pointee.lastErrno = err
                 cont.resume(returning: -1)
             }
             if let cont = state.pointee.pendingWrite {
                 state.pointee.pendingWrite = nil
                 state.pointee.pendingWriteCall = nil
                 state.pointee.writeDeadline = nil
+                state.pointee.lastErrno = err
                 cont.resume(returning: false)
             }
         }
@@ -1376,22 +1610,90 @@ public final class PollEventLoop: @unchecked Sendable {
 
         let fd = state.pointee.fd
 
-        // Read readiness: issue read(2) into internal buffer, resume waiter.
-        // EINTR is retried — a signal landing on the syscall must not
-        // surface as a spurious -1 ("error") that tears the connection
-        // down (the caller-visible result of this branch IS the read's
-        // return value).
+        // Read readiness: issue read(2) into the internal buffer, resume
+        // the waiter. EINTR is retried — a signal landing on the syscall
+        // must not surface as a spurious -1 ("error") that tears the
+        // connection down (the caller-visible result of this branch IS
+        // the read's return value).
+        //
+        // One maximal read per readiness — deliberately. With a fixed
+        // destination buffer a drain-until-EAGAIN loop is provably a
+        // no-op: a single read(2) of `readCapacity` bytes fills the
+        // buffer maximally, and a short read on a stream fd means the
+        // kernel had nothing more (read never withholds available
+        // data), so looping would only burn a probing syscall. The
+        // bulk-throughput lever is `readCapacity`, not extra reads —
+        // tokio's poll_read makes the same single-read choice.
         if event.isReadable, let cont = state.pointee.pendingRead {
-            state.pointee.pendingRead = nil
-            state.pointee.pendingReadCall = nil
-            state.pointee.readDeadline = nil
-            var n: Int = -1
-            while true {
-                n = Glibc.read(
-                    fd, state.pointee.readBuffer!, state.pointee.readCapacity)
-                if n >= 0 || errno != EINTR { break }
+            enum ReadOutcome {
+                case data(Int)
+                case eof
+                case failed(CInt)
+                case spurious
             }
-            cont.resume(returning: n)
+            let capacity = state.pointee.readCapacity
+            var total = 0
+            var outcome: ReadOutcome = .spurious
+            while true {
+                let want = capacity - total
+                let n = Glibc.read(
+                    fd, state.pointee.readBuffer! + total, want)
+                if n > 0 {
+                    total += Int(n)
+                    if total == capacity || Int(n) < want {
+                        outcome = .data(total)
+                        break
+                    }
+                    continue
+                }
+                if n == 0 {
+                    outcome = total > 0 ? .data(total) : .eof
+                    break
+                }
+                if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    // Spurious readiness: the kernel reported the fd
+                    // readable, but the read found nothing (checksum-
+                    // failed data dropped, or a racing consumer — not
+                    // possible in this loop's single-reader model, but
+                    // the kernel may still do it). Failing the wait
+                    // here (the old behaviour: resume -1) tore healthy
+                    // connections down. Instead: with data already
+                    // gathered, deliver it; with none, keep the wait
+                    // armed — the trailing `rearm` re-enables the
+                    // interest and readiness is re-evaluated. Tokio
+                    // semantics; no busy-loop risk (a MOD-armed
+                    // ONESHOT only fires on real readiness).
+                    outcome = total > 0 ? .data(total) : .spurious
+                    break
+                }
+                // Real error: capture errno BEFORE anything else on
+                // this thread can clobber it.
+                outcome = .failed(errno)
+                break
+            }
+            switch outcome {
+            case let .data(count):
+                state.pointee.pendingRead = nil
+                state.pointee.pendingReadCall = nil
+                state.pointee.readDeadline = nil
+                state.pointee.lastErrno = 0
+                cont.resume(returning: count)
+            case .eof:
+                state.pointee.pendingRead = nil
+                state.pointee.pendingReadCall = nil
+                state.pointee.readDeadline = nil
+                state.pointee.lastErrno = 0
+                cont.resume(returning: 0)
+            case let .failed(err):
+                state.pointee.pendingRead = nil
+                state.pointee.pendingReadCall = nil
+                state.pointee.readDeadline = nil
+                state.pointee.lastErrno = err
+                cont.resume(returning: -1)
+            case .spurious:
+                break  // wait stays armed; see comment above
+            }
         }
 
         // Write readiness: the caller owns the buffer and performs the
@@ -1403,6 +1705,7 @@ public final class PollEventLoop: @unchecked Sendable {
             state.pointee.pendingWrite = nil
             state.pointee.pendingWriteCall = nil
             state.pointee.writeDeadline = nil
+            state.pointee.lastErrno = 0
             cont.resume(returning: true)
         }
 
@@ -1413,17 +1716,24 @@ public final class PollEventLoop: @unchecked Sendable {
         // EPOLLHUP-without-IN case that `isReadClosed` would otherwise
         // claim. EPOLLRDHUP (peer half-close) alone does NOT fail a
         // pending write: the local side may still flush.
+        //
+        // lastErrno mapping: ERR waits record EIO (the real errno is
+        // not observable without attempting the I/O); HUP read-side is
+        // a clean EOF (0), HUP write-side records EPIPE (that is what
+        // the next write(2) would return).
         if event.ready.isError {
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
                 state.pointee.pendingReadCall = nil
                 state.pointee.readDeadline = nil
+                state.pointee.lastErrno = EIO
                 cont.resume(returning: -1)
             }
             if let cont = state.pointee.pendingWrite {
                 state.pointee.pendingWrite = nil
                 state.pointee.pendingWriteCall = nil
                 state.pointee.writeDeadline = nil
+                state.pointee.lastErrno = EIO
                 cont.resume(returning: false)
             }
         } else if event.ready.isHangup {
@@ -1431,12 +1741,14 @@ public final class PollEventLoop: @unchecked Sendable {
                 state.pointee.pendingRead = nil
                 state.pointee.pendingReadCall = nil
                 state.pointee.readDeadline = nil
+                state.pointee.lastErrno = 0
                 cont.resume(returning: 0)
             }
             if let cont = state.pointee.pendingWrite {
                 state.pointee.pendingWrite = nil
                 state.pointee.pendingWriteCall = nil
                 state.pointee.writeDeadline = nil
+                state.pointee.lastErrno = EPIPE
                 cont.resume(returning: false)
             }
         } else if event.ready.isReadClosed,
@@ -1445,6 +1757,7 @@ public final class PollEventLoop: @unchecked Sendable {
             state.pointee.pendingRead = nil
             state.pointee.pendingReadCall = nil
             state.pointee.readDeadline = nil
+            state.pointee.lastErrno = 0
             cont.resume(returning: 0)
         }
 
@@ -1472,9 +1785,11 @@ public final class PollEventLoop: @unchecked Sendable {
         }
         for request in requests {
             switch request {
-            case let .armRead(_, _, _, cont):
+            case let .armRead(channelId, _, _, cont):
+                setErrno(ECANCELED, on: channelId)
                 cont.resume(returning: -1)
-            case let .armWrite(_, _, _, cont):
+            case let .armWrite(channelId, _, _, cont):
+                setErrno(ECANCELED, on: channelId)
                 cont.resume(returning: false)
             case .cancel:
                 break
@@ -1498,11 +1813,13 @@ public final class PollEventLoop: @unchecked Sendable {
             if let cont = state.pointee.pendingRead {
                 state.pointee.pendingRead = nil
                 state.pointee.pendingReadCall = nil
+                state.pointee.lastErrno = ECANCELED
                 cont.resume(returning: -1)
             }
             if let cont = state.pointee.pendingWrite {
                 state.pointee.pendingWrite = nil
                 state.pointee.pendingWriteCall = nil
+                state.pointee.lastErrno = ECANCELED
                 cont.resume(returning: false)
             }
             // Free per-channel read buffers here as well: the raw
@@ -1575,8 +1892,23 @@ public final class PollEventLoop: @unchecked Sendable {
                 served &+= 1
                 if served == Self.maxJobsPerServicePass {
                     served = 0
-                    _ = try? events.wait(on: poll, timeout: PollTimeout.immediate)
-                    dispatchDeliveredEvents()
+                    // mio's Events.wait retries EINTR internally and
+                    // zeroes the delivered count on any error it does
+                    // surface (verified against its source) — so a
+                    // failed wait leaves `events` empty. The do/catch
+                    // keeps that an explicit local fact rather than a
+                    // cross-package assumption: dispatching only on
+                    // success stays correct even if mio ever changes
+                    // its error-path behaviour. Errors are not
+                    // escalated here: the main loop's next blocking
+                    // wait hits the same condition and owns the
+                    // retry/backoff/give-up policy.
+                    do {
+                        try events.wait(on: poll, timeout: PollTimeout.immediate)
+                        dispatchDeliveredEvents()
+                    } catch {
+                        // skip this service pass
+                    }
                 }
             }
             drainBuffer.removeAll(keepingCapacity: true)
@@ -1596,22 +1928,38 @@ public final class PollEventLoop: @unchecked Sendable {
         // metrics, never crashes a shutting-down server over a
         // straggler. (An UnownedJob cannot be faulted or cancelled —
         // running it is its only fate, and there is no thread left.)
-        if runExited.load(ordering: .acquiring) {
+        //
+        // The terminal check lives INSIDE poolQueue's lock, and the
+        // tail closes the job window by storing the flag under the
+        // SAME lock — so a cross-thread enqueue is strictly ordered
+        // against the close: either its append precedes the store
+        // (the tail's final drainJobs runs it), or its check sees the
+        // flag (dropped, counted). No silent stuck-in-box state.
+        let tid = loopThreadId.load(ordering: .acquiring)
+        if UInt(pthread_self()) == tid {
+            // Same-thread fast path: no synchronisation. The loop
+            // thread cannot race the tail's close — the tail IS the
+            // loop thread, and drainJobs runs until both queues are
+            // empty before returning.
+            loopJobs.append(job)
+            return
+        }
+        var dropped = false
+        let needWake = poolQueue.withLock { (queue: inout [UnownedJob]) -> Bool in
+            if runExited.load(ordering: .relaxed) {
+                dropped = true
+                return false
+            }
+            queue.append(job)
+            return tid != 0
+        }
+        if dropped {
             _ = droppedJobs.add(1)
             assertionFailure(
                 "PollEventLoop: job enqueued after run() returned — the loop " +
                 "is terminal; this job will never run (see droppedJobs)"
             )
             return
-        }
-        let tid = loopThreadId.load(ordering: .acquiring)
-        if UInt(pthread_self()) == tid {
-            loopJobs.append(job)
-            return
-        }
-        let needWake = poolQueue.withLock { (queue: inout [UnownedJob]) -> Bool in
-            queue.append(job)
-            return tid != 0
         }
         // The waker exists from init onward, so this can never be a
         // lost wakeup. (Jobs enqueued pre-run see tid == 0, skip the
@@ -1642,13 +1990,25 @@ extension PollEventLoop: SerialExecutor {
     /// thread-per-core model, "executing on this loop" means
     /// "executing on the loop's OS thread" — verifiable via
     /// `pthread_self()` against the stored `loopThreadId`.
+    ///
+    /// `loopThreadId == 0` — the loop is not running — is LEGAL,
+    /// mirroring `precondLoopThread`'s two blessed regimes: pre-`run()`
+    /// setup (the register-before-run pattern, single-threaded by
+    /// contract) and the post-`run()` terminal tail (an error-retry
+    /// `run()` re-registers channels through it). While the loop RUNS,
+    /// isolation is strictly "the loop's thread". (The same accepted
+    /// race window as `precondLoopThread`: a `run()` starting
+    /// concurrently may claim the thread between our load and the
+    /// decision.)
     public func checkIsolated() {
         let expected = loopThreadId.load(ordering: .acquiring)
-        let current = UInt(pthread_self())
-        if current != expected {
-            fatalError(
-                "PollEventLoop isolation violation: current thread \(current) is not the loop thread \(expected)"
-            )
+        if expected != 0 {
+            let current = UInt(pthread_self())
+            if current != expected {
+                fatalError(
+                    "PollEventLoop isolation violation: current thread \(current) is not the loop thread \(expected)"
+                )
+            }
         }
     }
 

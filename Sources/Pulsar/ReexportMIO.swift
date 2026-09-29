@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 //
 //  ReexportMIO.swift
-//  StarlightPoll
+//  Pulsar
 //
 //  Dedicated file for `@_exported import MIO`. Kept separate from
 //  `PollEventLoop.swift` because `@_exported import` combined with
@@ -15,7 +15,7 @@
 
 #if os(Linux)
 
-// Consumers of `import StarlightPoll` get `Poll`, `Token`, `Interest`,
+// Consumers of `import Pulsar` get `Poll`, `Token`, `Interest`,
 // `Ready`, `Event`, `Events`, `Waker`, `Registry`, `PollError`
 // transitively through this re-export.
 @_exported import MIO

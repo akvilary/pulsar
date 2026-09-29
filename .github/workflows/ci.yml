@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# mio is resolved by SwiftPM from the manifest's version bound
+# (github.com/akvilary/mio, 0.3.0 ..< 1.0.0) — the same form every
+# consumer gets. Bump the bound in Package.swift in lockstep with
+# mio releases.
+jobs:
+  test:
+    name: Tests (debug)
+    runs-on: ubuntu-latest
+    container: swift:6.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift test
+        run: swift test
+
+  tsan:
+    name: Tests (ThreadSanitizer)
+    runs-on: ubuntu-latest
+    container: swift:6.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift test --sanitize=thread
+        run: swift test --sanitize=thread
+
+  release:
+    name: Build (release, PulsarBench)
+    runs-on: ubuntu-latest
+    container: swift:6.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift build -c release
+        run: swift build -c release

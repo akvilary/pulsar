@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 //
 //  PaddedAtomic.swift
-//  StarlightCore
+//  Pulsar
 //
 //  Atomic counters padded to a cache line to prevent false sharing
 //  between cores. This is the H2O pattern (`char _unused_avoir_false_sharing[32];`
