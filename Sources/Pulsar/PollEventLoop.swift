@@ -170,6 +170,19 @@ internal struct PollChannelState {
     /// Trivial `CInt` — no ARC traffic, no layout impact on the hot
     /// path.
     var lastErrno: CInt = 0
+    /// Consecutive optimistic-read answers served WITHOUT suspending
+    /// (the caller-thread fast path — see `readIfReady`). Bounds the
+    /// starvation window of the cooperative-yield protocol: a Task
+    /// looping `read()` on a flooded source never suspends on its own,
+    /// so after `optimisticYieldAfter` immediate answers the fast path
+    /// steps aside once and the arm path yields the executor (whose
+    /// job-budget mechanism then services readiness for OTHER
+    /// channels — the tokio cooperation-budget analogue). Incremented
+    /// on EVERY immediate answer (data, EOF, error) — an EOF/error
+    /// spin must yield just like a data spin. Reset to 0 in `armRead`:
+    /// one reset site, exactly where the channel last waited.
+    /// Loop-thread state, like every other field.
+    var optimisticStreak: Int = 0
 }
 
 // MARK: - PollEventLoop
@@ -308,6 +321,16 @@ public final class PollEventLoop: @unchecked Sendable {
     /// `drainJobs`). A blocking wait there would deadlock: same-thread
     /// enqueues carry no eventfd wake.
     private static let maxJobsPerServicePass = 1024
+
+    /// Cooperative-yield threshold for the optimistic read path (see
+    /// `readIfReady` / `PollChannelState.optimisticStreak`). 64
+    /// immediate answers ≈ tens of microseconds of exclusive thread
+    /// time — small enough that other channels on the loop feel no
+    /// starvation, large enough that the per-yield arm+event cost is
+    /// amortized to noise (1/64 of the fast path). The tokio
+    /// cooperation-budget analogue (tokio budgets 128 leaf-future
+    /// ops before yielding; we are deliberately more conservative).
+    private static let optimisticYieldAfter = 64
 
     // Loop state.
     private let stopped = Atomic<Bool>(false)
@@ -1065,6 +1088,16 @@ public final class PollEventLoop: @unchecked Sendable {
     /// error, -2 on timeout). The fd was bound at `registerChannel(fd:)`
     /// — the loop reads through its own dup of it.
     ///
+    /// **Optimistic fast path**: when data is already buffered (the
+    /// dominant request/response case), one non-blocking `read(2)` on
+    /// the caller's thread answers immediately — no suspension, no
+    /// `epoll_ctl`, no `epoll_wait` cycle (the read-side counterpart
+    /// of `write`'s optimistic send loop; tokio's poll-read-first
+    /// model). Every 64 consecutive immediate answers the fast path
+    /// yields once via the arm path, bounding any single channel's
+    /// exclusive use of the loop thread (see
+    /// `PollChannelState.optimisticStreak`).
+    ///
     /// The buffer is owned by the eventLoop — callers access it via
     /// `getReadView(channelId:count:)` after this returns. This
     /// eliminates the need for the caller to own a raw buffer (and
@@ -1083,7 +1116,9 @@ public final class PollEventLoop: @unchecked Sendable {
     /// - Parameter deadline: absolute time after which an unanswered
     ///   readiness wait is failed with `-2` (timeout). `nil` disables
     ///   the timeout (compat). Enforced by `sweepTimeouts` on each
-    ///   timerfd tick, so granularity ≈ `timeoutSweepInterval`.
+    ///   timerfd tick, so granularity ≈ `timeoutSweepInterval`. An
+    ///   immediately-answered read ignores the deadline — the deadline
+    ///   bounds the WAIT, not the syscall.
     public func read(
         channelId: ChannelId,
         deadline: ContinuousClock.Instant? = nil,
@@ -1096,6 +1131,12 @@ public final class PollEventLoop: @unchecked Sendable {
         if Task.isCancelled {
             setErrnoIfLoopThread(ECANCELED, channelId)
             return -1
+        }
+        // Optimistic fast path — only in a regime that owns the table
+        // (loop thread or pre-run setup). Off-regime callers (legal
+        // for `cancellable: true`) take the request-queue path below.
+        if isLoopOrSetupThread(), let n = readIfReady(channelId) {
+            return n
         }
         if !cancellable {
             // Hot path: the arm happens synchronously in THIS frame —
@@ -1153,18 +1194,25 @@ public final class PollEventLoop: @unchecked Sendable {
         channels.pointer(slot: channelId.slot).pointee.lastErrno = e
     }
 
+    /// True when the calling thread may touch the channel table: the
+    /// loop thread, or the tid == 0 setup/terminal regime (mirroring
+    /// `precondLoopThread`'s two legal regimes). Entry fast-fails and
+    /// the optimistic read route through this — a cancellable call may
+    /// enter on the GLOBAL pool (Swift's cancellation wrapper hops
+    /// there), where the table must not be touched; those callers take
+    /// the request-queue path instead.
+    @inline(__always)
+    private func isLoopOrSetupThread() -> Bool {
+        let tid = loopThreadId.load(ordering: .acquiring)
+        return tid == 0 || UInt(pthread_self()) == tid
+    }
+
     /// `setErrno`, but only when executing in a regime that owns the
-    /// channel table: the loop thread, or the tid == 0 setup/terminal
-    /// regime (mirroring `precondLoopThread`). The `read` /
-    /// `awaitWritable` ENTRY fast-fails run on the caller's thread —
-    /// which for a cancellable call may be the global pool (Swift's
-    /// cancellation wrapper hops there), and touching the table from
-    /// there would race the loop. A non-cancellable contract violation
-    /// still traps at the arm's `precondLoopThread`, untouched.
+    /// channel table. A non-cancellable contract violation still traps
+    /// at the arm's `precondLoopThread`, untouched.
     @inline(__always)
     private func setErrnoIfLoopThread(_ e: CInt, _ channelId: ChannelId) {
-        let tid = loopThreadId.load(ordering: .acquiring)
-        if tid == 0 || UInt(pthread_self()) == tid {
+        if isLoopOrSetupThread() {
             setErrno(e, on: channelId)
         }
     }
@@ -1206,6 +1254,101 @@ public final class PollEventLoop: @unchecked Sendable {
         return channels.pointer(slot: channelId.slot).pointee.lastErrno
     }
 
+    /// Shared validation for any operation that arms or attempts I/O
+    /// on a data channel — the SINGLE source of truth shared by
+    /// `armRead`, `armWritable` and the optimistic `readIfReady`, so
+    /// the three paths can never drift apart:
+    ///
+    ///   * terminal shutdown → `nil` (the caller fails fast with
+    ///     `-1`/`false` + `ECANCELED` — in-flight Tasks must unwind
+    ///     gracefully through the shutdown tail, not trap on the
+    ///     reset table);
+    ///   * stale handle → precondition (a use-after-cancelChannel is a
+    ///     programming error, fail-fast instead of acting on the
+    ///     slot's new occupant);
+    ///   * watch channel → precondition (its events go to the handler;
+    ///     an armed wait there would hang forever).
+    ///
+    /// The overlapping-op precondition is NOT here — read and write
+    /// arms check their own continuation field.
+    ///
+    /// - Precondition: called on the loop thread (or pre-run setup) —
+    ///   enforced by `precondLoopThread`.
+    private func validatedDataChannel(
+        _ channelId: ChannelId, op: StaticString
+    ) -> UnsafeMutablePointer<PollChannelState>? {
+        precondLoopThread(op)
+        if stopped.load(ordering: .acquiring) { return nil }
+        guard channels.isValid(slot: channelId.slot, gen: channelId.generation)
+        else {
+            preconditionFailure(
+                "PollEventLoop.\(op): stale channel handle — use after cancelChannel (\(channelId))"
+            )
+        }
+        let state = channels.pointer(slot: channelId.slot)
+        precondition(state.pointee.watch == nil,
+            "PollEventLoop: async \(op) is unavailable on watch channels — the handler owns the I/O")
+        return state
+    }
+
+    /// One non-blocking `read(2)` into the channel buffer on the
+    /// CALLER's thread — the optimistic fast path (tokio's
+    /// poll-read-first model), the read-side counterpart of `write`'s
+    /// optimistic send loop. When data is already buffered — the
+    /// dominant request/response case, since the event that resumed
+    /// this Task usually delivered it — the call returns WITHOUT a
+    /// suspension, WITHOUT an `epoll_ctl(MOD)`, and WITHOUT an
+    /// `epoll_wait` cycle: the full arm→event→dispatch→resume
+    /// round-trip collapses into one syscall.
+    ///
+    /// Returns `nil` when the caller should arm instead (EAGAIN —
+    /// nothing readable — or the cooperative-yield threshold tripped);
+    /// any non-nil value is the caller-visible answer with semantics
+    /// IDENTICAL to the event-driven path (n>0 data, 0 EOF, -1 error
+    /// with `lastErrno` recorded). The registration is never touched:
+    /// a concurrent pendingWrite arm keeps waiting undisturbed.
+    ///
+    /// Off-regime callers never reach here (`read` routes them to the
+    /// request-queue path — see `isLoopOrSetupThread`); the
+    /// `precondLoopThread` below is the same defense-in-depth as
+    /// everywhere else.
+    ///
+    /// Starvation safety: every immediate answer increments
+    /// `optimisticStreak`; at `optimisticYieldAfter` the fast path
+    /// declines (returns nil) and the arm path yields the executor —
+    /// the job-budget mechanism then serves other channels. The
+    /// counter counts data, EOF and error answers alike: an EOF/error
+    /// spin must yield exactly like a data spin.
+    private func readIfReady(_ channelId: ChannelId) -> Int? {
+        guard let state = validatedDataChannel(channelId, op: "read") else {
+            // Terminal shutdown: fail fast, exactly like armRead's
+            // stopped-branch (in-flight Tasks unwind gracefully).
+            setErrno(ECANCELED, on: channelId)
+            return -1
+        }
+        precondition(state.pointee.pendingRead == nil,
+            "PollEventLoop: overlapping read on channelId=\(channelId)")
+        // Cooperative yield: after a run of immediate answers, step
+        // aside once — return nil so the caller takes the arm path and
+        // suspends, handing the executor to other channels.
+        if state.pointee.optimisticStreak >= Self.optimisticYieldAfter {
+            return nil
+        }
+        let fd = state.pointee.fd
+        var n: Int = -1
+        while true {
+            n = Glibc.read(
+                fd, state.pointee.readBuffer!, state.pointee.readCapacity)
+            if n >= 0 || errno != EINTR { break }
+        }
+        // EAGAIN is NOT an answer — it means "arm instead" (nil, no
+        // streak increment, no errno record: the op is not complete).
+        if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { return nil }
+        state.pointee.optimisticStreak &+= 1
+        state.pointee.lastErrno = n >= 0 ? 0 : errno
+        return n
+    }
+
     private func armRead(
         channelId: ChannelId,
         cont: CheckedContinuation<Int, Never>,
@@ -1214,33 +1357,27 @@ public final class PollEventLoop: @unchecked Sendable {
     ) {
         // Runs in the `read()` continuation body — i.e. on the awaiting
         // Task's thread, which the contract requires to be the loop
-        // (or pre-run setup). Enforced here so a mispinned caller fails
-        // at the first state mutation, not as a cross-thread race.
-        precondLoopThread("read")
+        // (or pre-run setup). Enforced by `validatedDataChannel` (the
+        // shared validator) so a mispinned caller fails at the first
+        // state mutation, not as a cross-thread race.
+        //
         // Shutdown is terminal: fail the wait immediately instead of
         // arming an interest nobody will ever deliver. This is what
         // lets in-flight Tasks unwind cleanly DURING shutdown — after
         // the tail resets the channel table, their handles are stale
         // and the old code trapped on the "stale handle" precondition
         // in exactly this path.
-        if stopped.load(ordering: .acquiring) {
+        guard let state = validatedDataChannel(channelId, op: "read")
+        else {
             setErrno(ECANCELED, on: channelId)
             cont.resume(returning: -1)
             return
         }
-        guard channels.isValid(slot: channelId.slot, gen: channelId.generation) else {
-            preconditionFailure(
-                "PollEventLoop.armRead: stale channel handle — use after cancelChannel (\(channelId))"
-            )
-        }
-        let state = channels.pointer(slot: channelId.slot)
-        // A watch channel's events are dispatched to its handler and
-        // never reach the continuation path — arming a read there
-        // would hang the awaiting Task forever. Fail fast instead.
-        precondition(state.pointee.watch == nil,
-            "PollEventLoop: async read is unavailable on watch channels — the handler owns the I/O")
         precondition(state.pointee.pendingRead == nil,
             "PollEventLoop: overlapping read on channelId=\(channelId)")
+        // The channel is about to WAIT — the optimistic-read streak
+        // ends here (see PollChannelState.optimisticStreak).
+        state.pointee.optimisticStreak = 0
         state.pointee.pendingRead = cont
         state.pointee.pendingReadCall = call
         state.pointee.readDeadline = deadline
@@ -1439,23 +1576,14 @@ public final class PollEventLoop: @unchecked Sendable {
         // See armRead: the awaiting Task must be loop-pinned, and a
         // terminal shutdown fails the wait gracefully (false) rather
         // than arming an undeliverable interest or trapping on the
-        // reset table.
-        precondLoopThread("awaitWritable/write")
-        if stopped.load(ordering: .acquiring) {
+        // reset table. (Threading + stale/watch validation live in the
+        // shared `validatedDataChannel`.)
+        guard let state = validatedDataChannel(channelId, op: "awaitWritable")
+        else {
             setErrno(ECANCELED, on: channelId)
             cont.resume(returning: false)
             return
         }
-        guard channels.isValid(slot: channelId.slot, gen: channelId.generation) else {
-            preconditionFailure(
-                "PollEventLoop.armWritable: stale channel handle — use after cancelChannel (\(channelId))"
-            )
-        }
-        let state = channels.pointer(slot: channelId.slot)
-        // Symmetric to armRead: a write-wait armed on a watch channel
-        // would never be resumed.
-        precondition(state.pointee.watch == nil,
-            "PollEventLoop: async write is unavailable on watch channels — the handler owns the I/O")
         precondition(state.pointee.pendingWrite == nil,
             "PollEventLoop: overlapping write on channelId=\(channelId) — previous continuation would leak")
         state.pointee.pendingWrite = cont

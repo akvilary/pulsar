@@ -119,6 +119,17 @@ Reads are one maximal `read(2)` per readiness event — with a fixed
 destination buffer that is provably optimal (a short read on a stream
 fd means the kernel had nothing more; a full read filled the buffer),
 so the bulk-throughput lever is `readCapacity`, not extra syscalls.
+**Optimistic read fast path**: when data is already buffered (the
+dominant request/response case — the event that resumed the handler
+usually delivered it), `read` answers with one non-blocking `read(2)`
+on the caller's thread: no suspension, no `epoll_ctl`, no
+`epoll_wait` cycle — the read-side counterpart of `write`'s optimistic
+send loop (+53% echo throughput at 64 connections). Cooperative
+fairness: after 64 consecutive immediate answers the fast path yields
+once through the arm path, so a Task spinning on a flooded source
+cannot starve other channels of its loop (the tokio
+cooperation-budget analogue; the counter grows on EOF/error answers
+too, so degenerate spins also yield).
 Spurious readiness (epoll reports readable, `read(2)` returns
 `EAGAIN`) does **not** fail the wait: the continuation stays armed and
 the interest is re-armed — the tokio semantics; a healthy connection

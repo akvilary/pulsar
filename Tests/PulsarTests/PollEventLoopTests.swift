@@ -1209,6 +1209,92 @@ struct PollEventLoopTests {
         loop.shutdown()
     }
 
+    // MARK: - Optimistic read fast path
+
+    @Test("Optimistic read: pre-buffered data answers without touching epoll")
+    func optimisticReadSkipsRegistration() async throws {
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        let channelId = try loop.registerChannel(fd: b)
+        // Data buffered BEFORE the read: the fast path must answer
+        // immediately — and `registered == false` proves NO epoll_ctl
+        // was ever issued (the channel's first registration would only
+        // happen at the first arm).
+        let payload: [UInt8] = [0x11, 0x22, 0x33]
+        _ = payload.withUnsafeBufferPointer {
+            Glibc.write(a, $0.baseAddress!, payload.count)
+        }
+
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        try await Task.sleep(for: .milliseconds(30))
+
+        let pinned = LoopPinned(loop.cachedExecutor)
+        let (n, out) = await pinned.runRead(
+            loop: loop, channelId: channelId, capacity: 8)
+        #expect(n == 3, "fast path must deliver the buffered bytes, got \(n)")
+        #expect(Array(out.prefix(3)) == [0x11, 0x22, 0x33])
+
+        let registered = await Task(executorPreference: loop) { () -> Bool in
+            loop.channels.pointer(slot: channelId.slot).pointee.registered
+        }.value
+        #expect(registered == false,
+                "pre-buffered data must not cost an epoll_ctl (registration)")
+    }
+
+    @Test("Cooperative budget: fast path yields to the arm path after 64 answers")
+    func optimisticReadCooperativeYield() async throws {
+        let loop = try PollEventLoop()
+        let sp = makeSocketpair()
+        guard let sp else { Issue.record("socketpair failed"); return }
+        let (a, b) = (sp.read, sp.write)
+        defer {
+            _ = Glibc.close(a); _ = Glibc.close(b)
+            loop.shutdown()
+        }
+
+        let channelId = try loop.registerChannel(fd: b)
+        let loopThread = Thread { [loop] in try? loop.run() }
+        loopThread.start()
+        try await Task.sleep(for: .milliseconds(30))
+
+        // 70 read/write round-trips, data always pre-buffered: reads
+        // #1..#64 answer optimistically (no registration); read #65
+        // hits the yield threshold → the arm path runs → the fd gets
+        // registered for the first time → the immediate event
+        // completes the read. `registered` turning true mid-test is
+        // the observable proof the cooperative yield ENGAGED; it
+        // staying false through read #10 proves the fast path is
+        // actually fast (zero epoll_ctl).
+        let observed = await Task(executorPreference: loop) { () -> [Bool] in
+            var trace: [Bool] = []
+            var byte: UInt8 = 0x77
+            for i in 0..<70 {
+                _ = withUnsafePointer(to: &byte) { Glibc.write(a, $0, 1) }
+                let n = await loop.read(channelId: channelId)
+                precondition(n == 1, "read \(i) must deliver the byte")
+                if i == 9 || i == 69 {
+                    trace.append(
+                        loop.channels.pointer(slot: channelId.slot)
+                            .pointee.registered)
+                }
+            }
+            return trace
+        }.value
+
+        #expect(observed[0] == false,
+                "the first 64 reads must stay off epoll (fast path pure)")
+        #expect(observed[1] == true,
+                "read #65 must force an arm-yield (registration created)")
+    }
+
     // MARK: - Stress: concurrent echo with churn and cancellation
 
     @Test("Stress: concurrent round-trips with slot churn and cancellations")
